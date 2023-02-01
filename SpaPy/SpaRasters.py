@@ -51,9 +51,6 @@ from osgeo import osr
 # Spa Libraries
 from SpaPy import SpaBase
 
-#from SpaPy  import SpaRasterMath
-#SpaRasterMath import * # required for defines
-
 ############################################################################
 # Globals
 ############################################################################
@@ -65,7 +62,7 @@ class SpaDatasetRaster:
 	Attributes:
 		GDALDataset:
 
-		GDALDataType
+		GDALDataType: See file header for supported types
 
 		WidthInPixels: an integer representing the number of pixels along the x-axis
 
@@ -73,21 +70,20 @@ class SpaDatasetRaster:
 
 		NumBands: an integer representing the number of bands
 
-		NoDataValue:
+		NoDataValue: Value used for transparent pixels when reading and writing data to formats that do not support masks.
 
-		TheMask:
+		TheMask: SpaRaster uses a mask internally to avoid problems with performing math on NoDataValues
 
-		TheBands:
+		TheBands: Array of bands where each entry has a 2D grid of pixel values
 
-		XMin:
+		XMin: typically the x coordinate value for the left-most pixel in the raster
+		YMin: typically the y coordinate value for the bottom pixel in the raster
 
-		YMin:
+		PixelWidth: Width of a pixel in reference units
+		PixelHeight: Height of a pixel in reference units
 
-		PixelWidth
-		PixelHeight
-
-		TheWKT
-		GCS
+		SpatialReference: Spatial reference (CRS)
+		GCS: GCS but not used yet
 		UTMZone
 		UTMSouth
 
@@ -120,9 +116,9 @@ class SpaDatasetRaster:
 		self.PixelHeight=1
 
 		# projection information
-		self.TheWKT=None
+		self.SpatialReference=None
 		self.GCS="WGS84"
-		self.UTMZone=None
+		self.UTMZone=None # if the zone is set, it takes over
 		self.UTMSouth=False
 
 	def CopyPropertiesButNotData(self,RasterDataset):
@@ -152,7 +148,11 @@ class SpaDatasetRaster:
 		self.PixelWidth=RasterDataset.PixelWidth
 		self.PixelHeight=RasterDataset.PixelHeight
 
-		self.TheWKT=RasterDataset.TheWKT
+		self.SpatialReference=None
+		
+		if (RasterDataset.SpatialReference!=None):
+			self.SpatialReference=RasterDataset.SpatialReference.Clone()
+			
 		self.GCS=RasterDataset.GCS
 		self.UTMZone=RasterDataset.UTMZone
 		self.UTMSouth=RasterDataset.UTMSouth
@@ -255,7 +255,7 @@ class SpaDatasetRaster:
 
 	def SetNumBands(self,NumBands): 
 		"""
-		Sets new value for number of bands in provided SpaDatasetRaster
+		Sets new value for number of bands in this SpaDatasetRaster
 
 		Parameters:
 			NumBands: Insert value of desired band amount found in raster
@@ -264,17 +264,41 @@ class SpaDatasetRaster:
 		"""		
 		self.NumBands=NumBands
 
-	def GetProjection(self):
+	def GetCRS(self):
 		"""
-		Retrieves projection of provided SpaDatasetRaster
+		Retrieves coordinate reference system/spatial reference of this SpaDatasetRaster
 
 		Parameters:
 			None
 		Returns:
 			Projection information for provided raster formatted into a list that includes projection, geographic coordinate system, spheroid, etc.
 		"""					
-		return(self.GDALDataset.GetProjection()) # jjg
+		return(self.SpatialReference)
 
+
+	def GetEPSGCode(self):
+		"""
+		Gets the EPSG Code for the current raster if available.
+
+		Parameters:
+			None
+		Returns:
+			EPSG Code for the current raster or None if the code is not available.
+		"""				
+		Result=None
+		if (self.SpatialReference!=None): self.SpatialReference.GetAttrValue("AUTHORITY", 1)
+		return(Result)
+
+	def SetEPSGCode(self,EPSGCode):
+		"""
+		Sets the spatial refrence for the current raster based on an EPSG Code.
+
+		Parameters:
+			EPSG Code as a number or strng
+		"""				
+		srs = osr.SpatialReference()
+		srs.ImportFromEPSG(format(EPSGCode))
+	
 
 	def GetResolution(self):
 		""" 
@@ -400,7 +424,7 @@ class SpaDatasetRaster:
 			Band information for selected band
 
 		"""
-		if (self.TheBands==None): throw("ERror")
+		if (self.TheBands==None): throw("Error")
 
 		return(self.TheBands[Index])
 
@@ -429,7 +453,7 @@ class SpaDatasetRaster:
 		"""		
 		return(self.TheBands)
 
-	def GetMinMax(self,Index):
+	def GetMinMax(self,Index=0):
 		"""
 		Returns the min and max values for the specified band
 
@@ -438,9 +462,53 @@ class SpaDatasetRaster:
 		Return:
 			Returns a tuple (static list) with the minimum and maximum raster values for the specific band index
 		"""
-		srcband = self.GDALDataset.GetRasterBand(Index)
-		return(srcband.GetMinimum(),srcband.GetMaximum())
+		TheBand=self.TheBands[Index]
+		
+		Min=None
+		Max=None
+		
+		NumRows=len(TheBand)
+		NumColumns=len(TheBand[0])
+		Row=0
+		while (Row<NumRows):
+			TheRow=TheBand[Row]
+			
+			Column=0
+			while (Column<NumColumns):
+				if (self.TheMask is None) or (self.TheMask[Row][Column]!=1):
+					TheValue=TheRow[Column]
+					if (Min==None): 
+						Min=TheValue
+						Max=TheValue
+					else:
+						if (Min>TheValue): Min=TheValue
+						if (Max<TheValue): Max=TheValue
+				Column+=1
+			Row+=1
+						
+		#srcband = self.GDALDataset.GetRasterBand(Index)
+		return(Min,Max)
 
+	#def GetMinMax(self):
+		#"""
+		#Returns the minimum and maximum values for each band in the raster.
+
+		#Returns:
+			#An array with one entry for each band and then a tuple with the min and max values.  An example for a
+			#one band raster would be: [(MinValue,MaxValue)].
+		#"""
+
+		#Result=[]
+
+		#for TheBand in self.TheBands: # add each of the bands from each of the datasets
+			
+			#Min=numpy.amin(TheBand)
+			#Max=numpy.amax(TheBand)
+			
+			#Result.append((Min,Max))
+
+		#return(Result)
+	
 	# Results additional information for each band.
 	# Not sure what to do with this function in the future
 	def GetBandInfo(self,Index):
@@ -477,7 +545,8 @@ class SpaDatasetRaster:
 
 	def SetType(self,GDALDataType):
 		"""
-		Set GDAL type for SpaDatasetRaster object
+		Set GDAL type for SpaDatasetRaster object.  If the current raster data does not match the type,
+		the data will be converted to match the specified type.
 
 		Parameters:
 			Desired data type
@@ -491,7 +560,64 @@ class SpaDatasetRaster:
 			self.GDALDataset = gdal.Translate('', GDALDataset, format="MEM",outputType=GDALDataType)
 
 	def GetNoDataValue(self):
+		"""
+		Returns the current NoDataValue that is used for transparent data in the raster.  
+
+		Returns:
+			NoDataValue
+		"""
 		return(self.NoDataValue)
+	
+	def GetHistogram(self,BandIndex=0,NumBins=10):
+		"""
+		Returns a histogram with the specified number of bins
+
+		Parameters:
+		    BandIndex: Index to the desired band or 0 if not specified
+			NumBins: Number of bins in the histogram or 10 if not specified
+			
+		Returns:
+			An array of arrays where each array contains a histogram and then the edges of the bins.
+			See https://numpy.org/doc/stable/reference/generated/numpy.histogram.html
+		"""
+
+		# setup the return value as an array of all zeros
+		Result=[]
+		Index=0
+		while (Index<NumBins):
+			Result.append(0)
+			Index+=1
+			
+		# Get the range of the data in the raster band
+		Min,Max=self.GetMinMax(BandIndex)
+		
+		# Get the width of each bin
+		BinWidth=(Max-Min)/(NumBins)
+		
+		# Go through the data adding 1 to each bin that a pixel falls into
+		TheBand=self.TheBands[BandIndex]
+		
+		NumRows=len(TheBand)
+		NumColumns=len(TheBand[0])
+		Row=0
+		while (Row<NumRows):
+			TheRow=TheBand[Row]
+			
+			Column=0
+			while (Column<NumColumns):
+				if (self.TheMask is None) or (self.TheMask[Row][Column]!=1):
+					TheValue=TheRow[Column]
+					
+					Bin=(TheValue-Min)/BinWidth
+					Bin=int(Bin)
+					if (Bin>=NumBins): Bin=NumBins-1 # the max value will end up with NumBins as the bin
+					
+					Result[Bin]+=1
+					
+				Column+=1
+			Row+=1
+
+		return(Result)
 	############################################################################
 	# Functions to manage spatial references
 	############################################################################
@@ -604,10 +730,13 @@ class SpaDatasetRaster:
 			self.PixelWidth=TheGeoTransform[1]
 			self.PixelHeight=TheGeoTransform[5]
 
-			#Thing=self.GDALDataset.GetProjection()
-			self.TheWKT=self.GDALDataset.GetProjectionRef()
-
-
+			# Get the spatial reference
+		#	self.TheWKT=self.GDALDataset.GetProjectionRef()
+			
+			self.SpatialReference=self.GDALDataset.GetSpatialRef()
+			
+			
+			# Load the bands of data
 			self.TheBands =[]
 			Count=0
 			while (Count<self.NumBands):
@@ -652,17 +781,12 @@ class SpaDatasetRaster:
 
 		outRaster = driver.Create(TheFilePath, self.WidthInPixels, self.HeightInPixels, self.NumBands,self.GDALDataType)
 
+		if (outRaster==None): raise Exception("Sorry, there was a problem creating the file at "+TheFilePath)
+		
 		outRaster.SetGeoTransform((self.XMin, self.PixelWidth, 0, self.YMax, 0, self.PixelHeight))
 
 		###########################################
 		#Setup the spatial reference
-		if (self.TheWKT!=None):
-			outRasterSRS = osr.SpatialReference()
-			#outRasterSRS.ImportFromWkt(self.TheWKT)
-			outRasterSRS.SetProjection(self.TheWKT)
-
-			outRaster.SetProjection(self.TheWKT)
-
 		if (self.UTMZone!=None):
 			# setup the spatial reference
 			srs = osr.SpatialReference()
@@ -674,15 +798,22 @@ class SpaDatasetRaster:
 			srs.SetWellKnownGeogCS(self.GCS)
 
 			outRaster.SetProjection(srs.ExportToWkt())
+			
+		elif (self.SpatialReference!=None):
+			#outRasterSRS = self.SpatialReference.Clone()
+			
+			#outRasterSRS.SetProjection(self.TheWKT)
 
-		#write out the data
+			outRaster.SetProjection(self.SpatialReference.ExportToWkt())
 
+		# write out the data
 		Count=0
 		while (Count<self.NumBands):
 			outband = outRaster.GetRasterBand(Count+1)
 
 			TheBand=self.TheBands[Count]
 
+			# Restore the no data values
 			if (self.NoDataValue!=None):
 				outband.SetNoDataValue(self.NoDataValue)
 				TheBand=numpy.where(self.TheMask,self.NoDataValue,TheBand)
@@ -708,9 +839,9 @@ class SpaDatasetRaster:
 		"""
 		drv = ogr.GetDriverByName("Memory")
 
-		#get spatial reference info
+		# get spatial reference info (jjg - I think we can just clone the SpatialReference)
 		srs = osr.SpatialReference()
-		srs.ImportFromWkt(self.TheWKT)
+		srs.ImportFromWkt(self.SpatialReference.ExportToWkt())
 
 		# Create a temporary data set in memory
 		DestinDataSource = drv.CreateDataSource('out')	
@@ -736,7 +867,9 @@ class SpaDatasetRaster:
 
 		for feature in DestinLayer:
 			# get the spatial reference and convert to WKT and then convert to a ShapelyGeometry
-			Geometry=feature.GetGeometryRef().ExportToWkt()
+			#ShapelyGeometry=feature.GetGeometryRef().Clone()
+
+			Geometry=feature.GetGeometryRef().ExportToWkt() # This is slow but currently required.  In the future we might support both types and then convert as needed jjg
 			ShapelyGeometry=shapely.wkt.loads(Geometry)
 
 			# setup the attribute array and add the feature to the output dataset
@@ -759,7 +892,6 @@ class SpaDatasetRaster:
 		#srcband=self.GDALDataset.GetRasterBand(1)
 
 	def Math(self,Operation,Input2):
-
 		"""
 		Handles all raster math operations using numPy arrays - called by one-line functions
 
@@ -776,8 +908,11 @@ class SpaDatasetRaster:
 
 		if (isinstance(Input2, numbers.Number)==False): # input is another dataset
 			# jjg - add checks for same number of bands, convertion to save width, height, and data type
+			
 			Input2=SpaBase.GetInput(Input2) # get the input as a dataset
-
+			
+			if (self.GetNumBands()!=Input2.GetNumBands()): raise Exception("Sorry, the number of bands in the two rasters must match")
+			
 			for TheBand in self.TheBands: # add each of the bands from each of the datasets
 				Band2=Input2.GetBand(BandIndex)
 
@@ -796,6 +931,7 @@ class SpaDatasetRaster:
 				elif (Operation==SPAMATH_MAX): NewBands.append(numpy.maximum(TheBand, Band2))
 				elif (Operation==SPAMATH_MIN): NewBands.append(numpy.minimum(TheBand, Band2))
 
+				# if the operation resulted in a Boolean raster, convert the raster to integer and type it as byte
 				if (Operation==SPAMATH_EQUAL) or (Operation==SPAMATH_NOT_EQUAL) or (Operation==SPAMATH_GREATER) or (Operation==SPAMATH_LESS) or \
 				   (Operation==SPAMATH_GREATER_OR_EQUAL) or (Operation==SPAMATH_LESS_OR_EQUAL) or (Operation==SPAMATH_AND) or (Operation==SPAMATH_OR) or \
 				   (Operation==SPAMATH_MAX) or (Operation==SPAMATH_MIN): 
@@ -835,6 +971,7 @@ class SpaDatasetRaster:
 				#elif (Operation==SPAMATH_CLIP_TOP): NewBands.append(numpy.clip(TheBand,0,Input2))
 				#elif (Operation==SPAMATH_CLIP_BOTTOM): NewBands.append(numpy.clip(TheBand,Input2,10000))
 
+				# if the operation resulted in a Boolean raster, convert the raster to integer and type it as byte
 				if (Operation==SPAMATH_EQUAL) or (Operation==SPAMATH_NOT_EQUAL) or (Operation==SPAMATH_GREATER) or (Operation==SPAMATH_LESS) or \
 				   (Operation==SPAMATH_GREATER_OR_EQUAL) or (Operation==SPAMATH_LESS_OR_EQUAL) or (Operation==SPAMATH_AND) or (Operation==SPAMATH_OR) or \
 				   (Operation==SPAMATH_MAX) or (Operation==SPAMATH_MIN): 
@@ -862,7 +999,7 @@ class SpaDatasetRaster:
 			of the corresponding cells in each of the two inputs
 		"""
 		Input1=SpaBase.GetInput(self)
-		return(Input1.Math(SPMATH_ADD,Input2))
+		return(Input1.Math(SPAMATH_ADD,Input2))
 
 	def __sub__(self, Input2): 
 		"""
@@ -876,7 +1013,7 @@ class SpaDatasetRaster:
 			the provided SPRasterDatasetObject and Input2
 		"""		
 		Input1=SpaBase.GetInput(self)
-		return(Input1.Math(SPMATH_SUBTRACT,Input2))
+		return(Input1.Math(SPAMATH_SUBTRACT,Input2))
 
 	def __mul__(self, Input2): 
 		"""
@@ -890,7 +1027,7 @@ class SpaDatasetRaster:
 			the corresponding cells in each of the two raster dataset objects
 		"""		
 		Input1=SpaBase.GetInput(self)
-		return(Input1.Math(SPMATH_MULTIPLY,Input2))
+		return(Input1.Math(SPAMATH_MULTIPLY,Input2))
 
 	def __truediv__(self, Input2): 
 		"""
@@ -904,7 +1041,7 @@ class SpaDatasetRaster:
 			of the values on the corresponding cells
 		"""				
 		Input1=SpaBase.GetInput(self)
-		return(Input1.Math(SPMATH_DIVIDE,Input2))
+		return(Input1.Math(SPAMATH_DIVIDE,Input2))
 
 	# Common comparison operators
 	def __lt__(self, Input2): # less than
@@ -1109,7 +1246,11 @@ class SpaResample(SpaBase.SpaTransform):
 		NewDataset.CopyPropertiesButNotData(InputRasterDataset)
 
 		GDALDataset = InputRasterDataset.GDALDataset
-		GDALDataset = gdal.Translate('', GDALDataset, format="MEM", projWin = Bounds)
+		
+		# Format for the bounds for gdal is [ulx uly lrx lry] which is [xmin,ymax,xmax,ymin]
+		NewBounds=[Bounds[0],Bounds[3],Bounds[2],Bounds[1]] 
+		
+		GDALDataset = gdal.Translate('', GDALDataset, format="MEM", projWin = NewBounds)
 		NewDataset.Load(GDALDataset)
 		GDALDataset = None
 		return(NewDataset)
@@ -1127,9 +1268,9 @@ class SpaResample(SpaBase.SpaTransform):
 		NewDataset.CopyPropertiesButNotData(InputRasterDataset)
 
 		UpperLeftRefX=Bounds[0]
-		UpperLeftRefY=Bounds[1]
+		UpperLeftRefY=Bounds[3]
 		LowerRightRefX=Bounds[2]
-		LowerRightRefY=Bounds[3]
+		LowerRightRefY=Bounds[1]
 
 		UpperLeftPixelX=InputRasterDataset.GetPixelXFromRefX(UpperLeftRefX)
 		UpperLeftPixelY=InputRasterDataset.GetPixelYFromRefY(UpperLeftRefY)
@@ -1189,7 +1330,8 @@ class SpaResample(SpaBase.SpaTransform):
 
 		TheMask = InputRasterDataset.TheMask
 		if (TheMask is not None):
-			OutputMask = scipy.ndimage.zoom(TheMask,ZoomFactor,output=None,order=order,mode='constant',cval=0.0,prefilter=True)
+			OutputMask = scipy.ndimage.zoom(TheMask,ZoomFactor,order=1,mode='nearest') # Must be order=1 for boolean values
+#			OutputMask = scipy.ndimage.zoom(TheMask,ZoomFactor,output=None,order=order,cval=0.0,prefilter=True)
 			OutputDataset.TheMask=OutputMask
 		else: 
 			OutputDataset.TheMask=None
@@ -1714,6 +1856,7 @@ def Minimum(Input1, Input2):
 
 	Input1=SpaBase.GetInput(Input1)
 	return(Input1.Math(SPAMATH_MIN,Input2))
+
 def And(Input1,Input2):
 	"""
 	One-line function for logical operation between two boolean rasters OR between one boolean raster and a constant boolean value. The order of the parameters does not matter.
@@ -1939,4 +2082,84 @@ def AbsoluteValue(Input1):
 	"""	
 	Input1=SpaBase.GetInput(Input1)
 	return(Input1.Math(SPAMATH_ABSOLUTE,0))
+####################################################################
+# Public utility functions
+####################################################################
+def ResampleToMatch(TheDataset1,TheDataset2):
+	"""
+	Resamples the specified datasets to create rasters that have the same pixel and
+	reference bounds as each other.  This function is typically used to prepare rasters
+	for raster math.  The bounds will be the area of overlap of the two rasters while 
+	the pixel dimensions will be the lower resolution of the two.
 
+	Parameters:
+		TheDataset1: SpaDatasetRaster object OR a string representing the path to the raster file.
+		TheDataset2: SpaDatasetRaster object OR a string representing the path to the raster file.
+
+	Returns:
+		A tuple with two SpaDatasetRaster objects ordered as (NewData1,NewData2)
+	"""
+	TheDataset1=SpaBase.GetInput(TheDataset1)
+	TheDataset2=SpaBase.GetInput(TheDataset2)
+	
+	Resolution1=TheDataset1.GetResolution()
+	TheBounds1=TheDataset1.GetBounds()  
+	
+	#TheDataset2=SpaRasters.SpaDatasetRaster()  
+	#TheDataset2.Load(RasterFilePath2)      
+	
+	Resolution2=TheDataset2.GetResolution()
+	TheBounds2=TheDataset2.GetBounds()  
+	
+	# make sure the two rasters represent the same spatial area
+	if (TheBounds1!=TheBounds2):
+		XMin=TheBounds1[0]
+		YMin=TheBounds1[1]
+		XMax=TheBounds1[2]
+		YMax=TheBounds1[3]
+		
+		if (TheBounds2[0]>XMin): XMin=TheBounds2[0]
+		if (TheBounds2[1]>YMin): YMin=TheBounds2[1]
+		if (TheBounds2[2]<XMax): XMax=TheBounds2[2]
+		if (TheBounds2[3]<YMax): YMax=TheBounds2[3]
+		
+		TheBounds=[XMin,YMin,XMax,YMax]
+		
+		TheDataset1=Crop(TheDataset1,TheBounds)
+		TheDataset2=Crop(TheDataset2,TheBounds)
+		
+		#print("Width in pixels: "+format(TheDataset1.GetWidthInPixels())) 
+		#print("Height in pixels: "+format(TheDataset1.GetHeightInPixels())) 
+		
+		#print("Width in pixels: "+format(TheDataset2.GetWidthInPixels())) 
+		#print("Height in pixels: "+format(TheDataset2.GetHeightInPixels())) 
+		
+	# Make sure the rasters have the same resolution
+	Resolution1=Resolution1[0]
+	Resolution2=Resolution2[0]
+	
+	if (Resolution1<Resolution2): 
+		TheDataset2=Resample(TheDataset2,Resolution2/Resolution1)
+	elif (Resolution1>Resolution2): 
+		TheDataset1=Resample(TheDataset1,Resolution1/Resolution2)
+	
+	# Make sure the masks only cover areas that are masked in both rasters
+	if (TheDataset1.TheMask is not None):
+		if (TheDataset2.TheMask is not None): # both have masks, combine them
+			
+			TheDataset1.TheMask=numpy.logical_or(TheDataset1.TheMask,TheDataset2.TheMask)
+			TheDataset2.TheMask=numpy.copy(TheDataset1.TheMask)
+		
+		else: # Only TheDataset1 has a mask
+			TheDataset2.TheMask=numpy.copy(TheDataset1.TheMask)
+	
+	elif (TheDataset2.TheMask is not None):
+		TheDataset1.TheMask=numpy.copy(TheDataset2.TheMask)
+		
+	#print("Width in pixels: "+format(TheDataset1.GetWidthInPixels())) 
+	#print("Height in pixels: "+format(TheDataset1.GetHeightInPixels())) 
+	
+	#print("Width in pixels: "+format(TheDataset2.GetWidthInPixels())) 
+	#print("Height in pixels: "+format(TheDataset2.GetHeightInPixels())) 
+
+	return(TheDataset1,TheDataset2)

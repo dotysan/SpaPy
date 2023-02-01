@@ -3,10 +3,14 @@
 # geometry and attributes (properties in the Fiona & Shapely terms).
 # Basic vector transformations are also supported.
 #
-# The layer contains:
-# - CRS - the coordinate system for the data
+# The dataset contains:
+# - CRS - the coordinate system for the data. TheCRS can be an EPSG code or a Proj parameter string
 # - AttributeDefs - definitions of the attributes (name, datatype, precision)
-# 
+# - Type - the type of vector data.  The following are supported: "Polygon", "Point","LineString","MultiPolygon","MultiPoint","MultiLineString"
+#   Note that the vector functions will only create Point, MultiLineString, and MultiPolygon files
+#   This is because we do not know for many transforms if the final result will be all polygons, all multipolgons or a mix of these.
+#   The current solution is to promote polygon files to MultiPolygon and LineString files to MultiLineString
+#
 # This class uses the open source libraries Fiona for reading and writing
 # shapefiles and Shapely for a number of transformations.
 #
@@ -118,7 +122,7 @@ class SpaDatasetVector:
 		self.TheAttributes=[]
 
 		self.Driver="ESRI Shapefile"
-		self.Type="Polygon"
+		self.Type=None
 		self.AttributeDefs={}
 
 		# Coordinate reference systems / spatial references can be in either a WKT format or a fiona CRS string.
@@ -187,7 +191,7 @@ class SpaDatasetVector:
 	############################################################################
 	from shapely import speedups
 	speedups.disable()
-	
+
 	def Load(self,FilePath):
 		"""
 		Function to load data from a path
@@ -207,10 +211,13 @@ class SpaDatasetVector:
 
 		GeometryIndex=0
 		for TheFeature in TheShapefile:
-			ShapelyGeometry = shapely.geometry.shape(TheFeature['geometry']) # Converts coordinates to a shapely feature
+			ShapelyGeometry=None
+			if (TheFeature['geometry']!=None):
+				ShapelyGeometry = shapely.geometry.shape(TheFeature['geometry']) # Converts coordinates to a shapely feature
 
 			self.TheGeometries.append(ShapelyGeometry)
 			self.TheAttributes.append(TheFeature['properties'])
+			GeometryIndex+=1
 
 		TheShapefile.close()
 
@@ -242,10 +249,16 @@ class SpaDatasetVector:
 		TheSchema={"geometry":self.Type,"properties":self.AttributeDefs}
 
 		TheCRS=self.CRS
-		if (self.crs_wkt!=None): TheCRS=self.crs_wkt
-		if (isinstance(TheCRS,int)): TheCRS={'init': 'epsg:'+format(TheCRS), 'no_defs': True}
-		#if (self.ProjParameters!=None):
-		#	TheCRS=self.ProjParameters
+		if (isinstance(TheCRS,int)): TheCRS={'init': 'epsg:'+format(TheCRS), 'no_defs': True} # integer must be an EPSG Code
+		elif (self.crs_wkt!=None): TheCRS=self.crs_wkt
+		elif (isinstance(TheCRS,str)):
+			Temp=TheCRS.lower()
+			Index=Temp.find("epsg")
+			if (Index!=-1): # need to pull the EPSG code, otherwise, the string may already be a proj4 string
+				Temp=Temp[Index+5:]
+				TheCRS={'init': 'epsg:'+format(Temp), 'no_defs': True}
+		else: # Should be a spatial reference object
+			TheCRS=TheCRS.to_proj4()
 
 		TheOutput=fiona.open(FilePath,'w',  encoding='utf-8',crs=TheCRS, driver=self.Driver,schema=TheSchema) # jjg - added encoding to remove warning on Natural Earth shapefiles
 
@@ -292,6 +305,9 @@ class SpaDatasetVector:
 		Returns:
 			none
 		"""	
+		if (Type=="Polygon"): Type="MultiPolygon"
+		if (Type=="LineString"): Type="MultiLineString"
+
 		if (len(self.TheGeometries)>0): raise Exception("Sorry, you cannot set the type after a dataset contains data")
 		self.Type=Type
 
@@ -590,6 +606,11 @@ class SpaDatasetVector:
 			TheAttributes=self.TheAttributes[Row]
 			self._AddGeometries(TheGeometry, TheAttributes, NewGeometries, NewAttributes)
 			Row+=1
+
+		# This is one case where we end up with a shapefile composed of individual polygons, points, or linestrings as shapes
+		if (len(NewGeometries)>0): self.Type=NewGeometries[0].geom_type
+
+		# Save the new geometries and attributes as the current ones
 		self.TheGeometries=NewGeometries
 		self.TheAttributes=NewAttributes
 
@@ -630,7 +651,19 @@ class SpaDatasetVector:
 			none
 
 		"""
+
+		if (self.Type==None): 
+			self.SetType(TheGeometry.geom_type)
+
+		# By default, we only support 
+		if (TheGeometry.geom_type!=self.Type): 
+			if (TheGeometry.geom_type=="Polygon"): TheGeometry=shapely.geometry.MultiPolygon([TheGeometry])
+			elif (TheGeometry.geom_type=="LineString"): TheGeometry=shapely.geometry.MultiLineString([TheGeometry])
+			else:
+				raise Exception("The geometry does not match the specified type of "+format(self.Type))
+
 		self.TheGeometries.append(TheGeometry)
+
 		if (TheAttributes==None):
 			TheAttributes={}
 
@@ -765,7 +798,7 @@ class SpaDatasetVector:
 		"""
 		NewLayer=SpaDatasetVector()
 		NewLayer.CopyMetadata(self)
-		NewLayer.Type="Polygon"
+		NewLayer.Type="MultiPolygon"
 
 		NumFeatures=self.GetNumFeatures()
 		FeatureIndex=0
@@ -800,6 +833,7 @@ class SpaDatasetVector:
 		"""
 		NewLayer=SpaDatasetVector()
 		NewLayer.CopyMetadata(self)
+		NewLayer.SetType(None)
 
 		NumFeatures=self.GetNumFeatures()
 		FeatureIndex=0
@@ -813,7 +847,7 @@ class SpaDatasetVector:
 
 	def ConvexHull(self):
 		"""
-		Find the simplest polygon that surounds each feature without having an concave segments.
+		Find the simplest polygon that surounds each feature without having any concave segments.
 
 		Parameters:
 			none
@@ -822,6 +856,7 @@ class SpaDatasetVector:
 		"""
 		NewLayer=SpaDatasetVector()
 		NewLayer.CopyMetadata(self)
+		NewLayer.SetType(None)
 
 		NumFeatures=self.GetNumFeatures()
 		FeatureIndex=0
@@ -959,6 +994,7 @@ class SpaDatasetVector:
 		"""
 		NewDataset=SpaDatasetVector()
 		NewDataset.CopyMetadata(self)
+		NewDataset.SetType(None) # we do not know what the resulting type will be until the first transform is complete
 
 		if (isinstance(TheTarget, shapely.geometry.base.BaseGeometry)): # input is a shapely geometry
 			self.OverlayWithGeometry(TheTarget,TheOperation,NewDataset)
@@ -980,24 +1016,27 @@ class SpaDatasetVector:
 		"""
 		NewDataset=SpaDatasetVector()
 		NewDataset.CopyMetadata(self)
+		NewDataset.SetType(None)
 
 		NumFeatures=self.GetNumFeatures()
-		NewGeometry=self.TheGeometries[0]
-		
-		FeatureIndex=1
-		while (FeatureIndex<NumFeatures): # interate through all the features finding the intersection with the geometry
-			TheGeometry=self.TheGeometries[FeatureIndex]
 
-			NewGeometry=self.OverlayGeometryWithGeometry(TheGeometry, NewGeometry,TheOperation)
+		if (NumFeatures>0):
+			NewGeometry=self.TheGeometries[0]
 
-			FeatureIndex+=1
-			
-		# Add the new single feature with the first set of attributes
-		if (NewGeometry!=None) and (NewGeometry.is_empty==False) and (NewGeometry.is_valid):
-			NewDataset.AddFeature(NewGeometry,self.TheAttributes[0])
+			FeatureIndex=1
+			while (FeatureIndex<NumFeatures): # interate through all the features finding the intersection with the geometry
+				TheGeometry=self.TheGeometries[FeatureIndex]
+
+				NewGeometry=self.OverlayGeometryWithGeometry(TheGeometry, NewGeometry,TheOperation)
+
+				FeatureIndex+=1
+
+			# Add the new single feature with the first set of attributes
+			if (NewGeometry!=None) and (NewGeometry.is_empty==False) and (NewGeometry.is_valid):
+				NewDataset.AddFeature(NewGeometry,self.TheAttributes[0])
 
 		return(NewDataset)
-	
+
 	############################################################################
 	# Overlay transform functions
 	############################################################################
@@ -1120,7 +1159,7 @@ class SpaDatasetVector:
 			none
 		"""
 		Result=False
-		
+
 		NumFeatures=self.GetNumFeatures()
 		FeatureIndex=0
 		while (FeatureIndex<NumFeatures): # interate through all the features finding the intersection with the geometry
@@ -1131,7 +1170,7 @@ class SpaDatasetVector:
 			if (Flag): Result=True
 
 			FeatureIndex+=1
-			
+
 		return(Result)
 
 	def RelateWithDataset(self,TheTarget,TheOperation,NewDataset):
@@ -1146,7 +1185,7 @@ class SpaDatasetVector:
 
 		"""
 		Result=False
-		
+
 		NumFeatures=TheTarget.GetNumFeatures()
 		FeatureIndex=0
 		while (FeatureIndex<NumFeatures): # interate through all the features finding the intersection with the geometry
@@ -1158,7 +1197,7 @@ class SpaDatasetVector:
 			if (Flag): Result=True
 
 			FeatureIndex+=1
-				
+
 		return(Result)
 
 	def Relate(self,TheTarget,TheOperation):
@@ -1172,7 +1211,7 @@ class SpaDatasetVector:
 			A SpaDatasetVector object
 		"""
 		Result=False
-		
+
 		NewDataset=SpaDatasetVector()
 		NewDataset.CopyMetadata(self)
 
@@ -1195,13 +1234,13 @@ class SpaDatasetVector:
 			NewDataset: The SpaDatasetVector object
 		"""
 		Result=False
-		
+
 		NewDataset=SpaDatasetVector()
 		NewDataset.CopyMetadata(self)
 
 		NumFeatures=self.GetNumFeatures()
 		NewGeometry=self.TheGeometries[0]
-		
+
 		FeatureIndex=1
 		while (FeatureIndex<NumFeatures): # interate through all the features finding the intersection with the geometry
 			TheGeometry=self.TheGeometries[FeatureIndex]
@@ -1209,11 +1248,11 @@ class SpaDatasetVector:
 			Flag=self.RelateGeometryWithGeometry(TheGeometry, NewGeometry,TheOperation)
 
 			if (Flag): Result=True
-			
+
 			FeatureIndex+=1
 
 		return(Result)
-	
+
 	############################################################################
 	# Relate transform functions
 	############################################################################
@@ -1360,7 +1399,7 @@ class SpaLayerVector:
 					TheCoords=TheGeometry.coords[0]
 					X=TheCoords[0]
 					Y=TheCoords[1]
-					
+
 					TheView.RenderRefEllipse(X,Y,MarkSize)
 
 					FeatureIndex+=1

@@ -518,9 +518,10 @@ class SpaView():
 		TheBand=TheBands[0]
 		
 		if (Stretch):
-			Min=numpy.amin(TheBand)
+			Min,Max=TheRasterDataset.GetMinMax(0)
+	#		Min=numpy.amin(TheBand)
 			
-			Max=numpy.amax(TheBand)
+		#	Max=numpy.amax(TheBand)
 			super_threshold_indices = TheBand<0.00000001
 			TheBand[super_threshold_indices] = 0
 			Min=numpy.amin(TheBand)

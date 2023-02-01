@@ -150,7 +150,8 @@ class SpaDensify(SpaBase.SpaTransform):
 	def Densify(self,TheDataset,Amount):
 		NewDataset=SpaVectors.SpaDatasetVector()
 		NewDataset.CopyMetadata(TheDataset)
-
+		NewDataset.SetType(None)
+		
 		NumFeatures=TheDataset.GetNumFeatures()
 		FeatureIndex=0
 		while (FeatureIndex<NumFeatures): # interate through all the features finding the intersection with the geometry

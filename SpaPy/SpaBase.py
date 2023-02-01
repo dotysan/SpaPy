@@ -24,6 +24,12 @@ import types
 import math
 
 ############################################################################
+#Global variables
+############################################################################
+
+SpaTempFolder="../Temp/"
+
+############################################################################
 # Basic Geometry utilities
 ############################################################################
 
@@ -69,6 +75,14 @@ def GetSegmentLength(X1,Y1,X2,Y2):
 	DY=Y2-Y1
 	Length=math.sqrt(DX*DX+DY*DY)
 	return(Length)
+
+def SetTempFolderPath(NewTempFolderPath):
+	SpaTempFolder=NewTempFolderPath
+
+def GetTempFolderPath():
+	return(SpaTempFolder)
+	
+
 
 ############################################################################
 # Base Class definitions
