@@ -20,6 +20,13 @@
 # The GDAL bindings return numpy arrays of the data so this was helpful:
 # https://gis.stackexchange.com/questions/150300/how-to-place-an-numpy-array-into-geotiff-image-using-python-gdal
 #
+# Data is available using numpy arrays.  numpy masked arrays are not implemented for all numpy functions so a separate mask
+# is maintained as a numpy array of booleans were True means masked and False means not masked.  This allows a numpy masked
+# array to be created where needed for speed such as min/max and histogram operations.  The mask may be ingored except when:
+# - Changing the resolution or shape of the raster
+# - When combining rasters together that may be different masks
+# Also, pixels that are masked can be ignored to improve speed if desired.
+#
 # Copyright (C) 2020, Humboldt State University, Jim Graham
 #
 # This program is free software: you can redistribute it and/or modify it
@@ -47,6 +54,7 @@ import scipy
 from osgeo import ogr
 import scipy.ndimage
 from osgeo import osr
+from osgeo.utils import gdal_merge
 
 # Spa Libraries
 from SpaPy import SpaBase
@@ -57,10 +65,27 @@ from SpaPy import SpaBase
 
 class SpaDatasetRaster:
 	"""
-	Class to manage the data associated with a spatial layer
-
+	Class to manage the data associated with a spatial layer.  The data can be in any combination of the
+	following locations:
+	- A file
+	- In numpy arrays 
+	- In a GDALDataset Mem (memory) object
+	
+	Reading and write large rasters from and to files can take a great deal of time so we need to minimize
+	how often this occurs.
+	
+	Some transforms can perform file to file operations.  This means we should not load the data all the time.
+	Other transforms require the data to be in numpy arrays which means the data will have to be loaded
+	into the arrays.  Also, new rasters can be created and held in memory (GDAL object or numpy arrays) and
+	not written to a file.
+	
+	For these reasons, data is only read or written when requested.  
+	
+	Load() - loads the attributes of the raster into the object but not the data
+	GetGDALDataset() - loads the data from a file or creates it from existing numpy arrays.
+	GetBands() - returns numpy arrays with the data or reads the data from the file.
+	
 	Attributes:
-		GDALDataset:
 
 		GDALDataType: See file header for supported types
 
@@ -93,23 +118,22 @@ class SpaDatasetRaster:
 		Initializes an empty instance of SpaDatasetRasters
 		"""
 
-		# below are the properties that make up a shapefile using Fiona for reading and writing from and to shapefiles
-
-		self.GDALDataset=None
-		self.GDALDataType=None
-
+		self.FilePath=None
 		self.WidthInPixels=100
 		self.HeightInPixels=100
 		self.NumBands=1
 
-		# mask, if NoDataValue!=None, then TheMask contains 1 where there is data, 0 otherwise
+		# mask, if NoDataValue is not None, then TheMask contains 1 where there is data, 0 otherwise
 		self.NoDataValue=None
-		self.TheMask=None
+		self.TheMask=None # Optional numpy array used as a mask
 
 		# the actual data for each band as numpy arrays
 		self.TheBands=None # list with one entry for each band
 
-		# reference coordinates for the raster
+		# 
+		self.GDALDataset=None
+		self.GDALDataType=None
+		# reference coordinates for the raster
 		self.XMin=0
 		self.YMax=0
 		self.PixelWidth=1
@@ -139,7 +163,7 @@ class SpaDatasetRaster:
 		self.NumBands=RasterDataset.NumBands
 
 		self.NoDataValue=RasterDataset.NoDataValue
-		self.TheMask=None
+		#self.TheMask=None
 
 		self.TheBands=None
 
@@ -150,7 +174,7 @@ class SpaDatasetRaster:
 
 		self.SpatialReference=None
 		
-		if (RasterDataset.SpatialReference!=None):
+		if (RasterDataset.SpatialReference is not None):
 			self.SpatialReference=RasterDataset.SpatialReference.Clone()
 			
 		self.GCS=RasterDataset.GCS
@@ -173,11 +197,10 @@ class SpaDatasetRaster:
 		NewDataset.TheBands=[]
 		for SourceArray in self.TheBands:
 			DestinArray = numpy.array(SourceArray)
-			#DestinArray = [row[:] for row in SourceArray]
 			NewDataset.TheBands.append(DestinArray)
 
 		# make a copy of the mask, if there is one
-		if (self.NoDataValue!=None) and (self.TheMask is not None):
+		if (self.NoDataValue is not None) and (self.TheMask is not None):
 			NewDataset.TheMask=numpy.array(self.TheMask)
 		else:
 			NewDataset.TheMask=None
@@ -286,7 +309,7 @@ class SpaDatasetRaster:
 			EPSG Code for the current raster or None if the code is not available.
 		"""				
 		Result=None
-		if (self.SpatialReference!=None): self.SpatialReference.GetAttrValue("AUTHORITY", 1)
+		if (self.SpatialReference is not None): self.SpatialReference.GetAttrValue("AUTHORITY", 1)
 		return(Result)
 
 	def SetEPSGCode(self,EPSGCode):
@@ -321,7 +344,7 @@ class SpaDatasetRaster:
 		Returns:
 			none
 		"""				
-		if (PixelHeight==None): PixelHeight=PixelWidth
+		if (PixelHeight is None): PixelHeight=PixelWidth
 		self.PixelWidth=PixelWidth
 		self.PixelHeight=PixelHeight
 
@@ -424,7 +447,7 @@ class SpaDatasetRaster:
 			Band information for selected band
 
 		"""
-		if (self.TheBands==None): throw("Error")
+		if (self.TheBands is None): throw("Error")
 
 		return(self.TheBands[Index])
 
@@ -440,7 +463,34 @@ class SpaDatasetRaster:
 
 		"""	
 		self.TheBands=TheBands
+		self.GDALDataset=None # have to recreate the GDAL dataset if the bands are replaced
+		
+	def SetMask(self,TheMask,NewValue=None):
+		"""
+		Sets a new mask.  The mask can be None or a new array.  If a NewValue is specified, the current
+		mask values will be replaced by the NewValue.  If TheMask is None, the NoDataValue will be set to None
+		"""
+		if (NewValue is not None):
+			TheBands=self.GetBands()
+			NewBands=[]
+			
+			Index=0
+			while (Index<len(TheBands)):
+				TheBand=TheBands[Index]
+				
+				NewBand=numpy.where(self.TheMask,NewValue,TheBand)
+				NewBands.append(NewBand)
+				
+				Index+=1
+				
+			self.SetBands(NewBands)
+			
+		self.TheMask=TheMask
+		
+	def GetMask(self):
+		return(self.TheMask)
 
+		
 	def GetBands(self):
 		"""
 		Retreive band information for SpaRaster object
@@ -451,8 +501,38 @@ class SpaDatasetRaster:
 			Band information for SpaRaster object
 
 		"""		
+		if (self.TheBands is None):
+			if (self.GDALDataset is not None):
+				# Get the first band to see if we have a mask (NoDataValue)
+				TheMask=None
+				FirstBand = self.GDALDataset.GetRasterBand(1)
+				self.NoDataValue=FirstBand.GetNoDataValue()
+	
+				# this is ugly but GDAL returns 0 for a no data value that is missing
+				if (self.NoDataValue==0): self.NoDataValue=None 
+				
+				# Load the bands of data
+				self.TheBands =[]
+				Count=0
+				while (Count<self.NumBands):
+					# Read the band from the file and get the numpy array
+					TheBand=self.GDALDataset.GetRasterBand(Count+1)
+					TheBand=TheBand.ReadAsArray()
+					
+					if (self.NoDataValue is not None) and (TheMask is None): # have to create the mask
+						
+						# Find where pixels match the no data value (note that in numpy, False indicates a valid pixel (i.e. not masked))
+						TheMask=numpy.equal(TheBand,self.NoDataValue)
+						
+					self.TheBands.append(TheBand)
+					
+					Count+=1
+	
+				self.TheMask=TheMask
+					
 		return(self.TheBands)
 
+			
 	def GetMinMax(self,Index=0):
 		"""
 		Returns the min and max values for the specified band
@@ -466,55 +546,26 @@ class SpaDatasetRaster:
 		
 		Min=None
 		Max=None
-		
-		NumRows=len(TheBand)
-		NumColumns=len(TheBand[0])
-		Row=0
-		while (Row<NumRows):
-			TheRow=TheBand[Row]
+				
+		if (self.TheMask is not None): # if there is a mask, use it
+			TheBand=numpy.ma.masked_array(TheBand,self.TheMask)
+			Min=numpy.ma.MaskedArray.min(TheBand)
+			Max=numpy.ma.MaskedArray.max(TheBand)
 			
-			Column=0
-			while (Column<NumColumns):
-				if (self.TheMask is None) or (self.TheMask[Row][Column]!=1):
-					TheValue=TheRow[Column]
-					if (Min==None): 
-						Min=TheValue
-						Max=TheValue
-					else:
-						if (Min>TheValue): Min=TheValue
-						if (Max<TheValue): Max=TheValue
-				Column+=1
-			Row+=1
-						
-		#srcband = self.GDALDataset.GetRasterBand(Index)
+		else: # no mask
+			
+			Min=numpy.amin(TheBand)
+			Max=numpy.amax(TheBand)
+		
 		return(Min,Max)
 
-	#def GetMinMax(self):
-		#"""
-		#Returns the minimum and maximum values for each band in the raster.
-
-		#Returns:
-			#An array with one entry for each band and then a tuple with the min and max values.  An example for a
-			#one band raster would be: [(MinValue,MaxValue)].
-		#"""
-
-		#Result=[]
-
-		#for TheBand in self.TheBands: # add each of the bands from each of the datasets
-			
-			#Min=numpy.amin(TheBand)
-			#Max=numpy.amax(TheBand)
-			
-			#Result.append((Min,Max))
-
-		#return(Result)
-	
 	# Results additional information for each band.
 	# Not sure what to do with this function in the future
 	def GetBandInfo(self,Index):
 		"""
 		Retreive band info from SpaDatasetRaster object for selected band
-
+		Note: This function uses GDAL directly and should only be used if required.
+		
 		Parameters:
 			Index: Input desired band here
 		Returns:
@@ -523,7 +574,7 @@ class SpaDatasetRaster:
 		"""				
 		srcband = self.GDALDataset.GetRasterBand(Index)
 		Result=None
-		if (srcband!=None):
+		if (srcband is not None):
 			Result={
 				"Scale":srcband.GetScale(),
 				"UnitType":srcband.GetUnitType(),
@@ -556,7 +607,7 @@ class SpaDatasetRaster:
 		"""		
 		self.GDALDataType=GDALDataType
 
-		if (self.GDALDataset!=None):
+		if (self.GDALDataset is not None):
 			self.GDALDataset = gdal.Translate('', GDALDataset, format="MEM",outputType=GDALDataType)
 
 	def GetNoDataValue(self):
@@ -577,45 +628,20 @@ class SpaDatasetRaster:
 			NumBins: Number of bins in the histogram or 10 if not specified
 			
 		Returns:
-			An array of arrays where each array contains a histogram and then the edges of the bins.
+			An array of arrays where each array contains a histogram and then another array with the edges of the bins.
 			See https://numpy.org/doc/stable/reference/generated/numpy.histogram.html
 		"""
 
 		# setup the return value as an array of all zeros
 		Result=[]
-		Index=0
-		while (Index<NumBins):
-			Result.append(0)
-			Index+=1
-			
-		# Get the range of the data in the raster band
-		Min,Max=self.GetMinMax(BandIndex)
-		
-		# Get the width of each bin
-		BinWidth=(Max-Min)/(NumBins)
 		
 		# Go through the data adding 1 to each bin that a pixel falls into
 		TheBand=self.TheBands[BandIndex]
 		
-		NumRows=len(TheBand)
-		NumColumns=len(TheBand[0])
-		Row=0
-		while (Row<NumRows):
-			TheRow=TheBand[Row]
-			
-			Column=0
-			while (Column<NumColumns):
-				if (self.TheMask is None) or (self.TheMask[Row][Column]!=1):
-					TheValue=TheRow[Column]
-					
-					Bin=(TheValue-Min)/BinWidth
-					Bin=int(Bin)
-					if (Bin>=NumBins): Bin=NumBins-1 # the max value will end up with NumBins as the bin
-					
-					Result[Bin]+=1
-					
-				Column+=1
-			Row+=1
+		if (self.TheMask is not None): # if there is a mask, use it
+			Result=numpy.histogram(TheBand, bins=NumBins, weights=self.TheMask)
+		else:
+			Result=numpy.histogram(TheBand, bins=NumBins)
 
 		return(Result)
 	############################################################################
@@ -693,19 +719,22 @@ class SpaDatasetRaster:
 			none
 
 		"""				
-		if isinstance(FilePathOrDataset,gdal.Dataset):
+
+		if isinstance(FilePathOrDataset,gdal.Dataset): # A dataset was specified, set it as the current GDALDataset
 			self.GDALDataset=FilePathOrDataset
 		else:
+			self.FilePath=FilePathOrDataset
 			self.GDALDataset=gdal.Open(FilePathOrDataset)
-		if (self.GDALDataset==None):
+			
+		if (self.GDALDataset is None):
 			raise Exception("Sorry, the file "+FilePathOrDataset+" could not be opened.  Please, make sure the file path is correct and is of a supported file type.")
 		else:
 			# get the desired band
-			outband = self.GDALDataset.GetRasterBand(1)
+			FirstBand = self.GDALDataset.GetRasterBand(1)
 
 			# Get the GDAL data type and convert it to a numpy datatype
 
-			self.GDALDataType=outband.DataType
+			self.GDALDataType=FirstBand.DataType
 
 			# get the dimensions in pixels and the number of bands
 			self.WidthInPixels=self.GDALDataset.RasterXSize
@@ -731,24 +760,82 @@ class SpaDatasetRaster:
 			self.PixelHeight=TheGeoTransform[5]
 
 			# Get the spatial reference
-		#	self.TheWKT=self.GDALDataset.GetProjectionRef()
-			
 			self.SpatialReference=self.GDALDataset.GetSpatialRef()
 			
+			self.GetBands()
+
+	def GetGDALDataset(self):
+		
+		if (self.GDALDataset is None):
+			self.GDALDataset=self.GetGDALDataset2()
 			
-			# Load the bands of data
-			self.TheBands =[]
+		return(self.GDALDataset)
+	
+	def GetGDALDataset2(self,TheFilePath=None):
+		"""
+		Private function to either return an existing GDALDataset or create a new one from the existing numpy arrays
+		
+		TheFilePath - for creating a dataset wth a file path to write to.  The file extension will determine the file type
+		DriverName - " MEM " for memory, gdal.GetDriverByName(  " MEM " )
+		"""
+		OutputGDALDataset=None
+		
+		if (self.GDALDataset is None) or (True): # if the data was not loaded using a GDALDataset, then create a new one and copy the data to the specifed file and/or memory
+			
+			DriverName="MEM"
+			
+			if (TheFilePath is not None):
+				FileName,Extension=os.path.splitext(TheFilePath)
+		
+				Extension=Extension.lower()
+	
+				if (Extension==".tif") or (Extension==".tiff"):
+					DriverName="GTiff"
+				elif (Extension==".png"):
+						DriverName="PNG"
+				elif (Extension==".jpg"):
+					DriverName="JPG" 
+				elif (Extension==".asc"):
+					DriverName="AAIGrid"
+				elif (Extension==".img"):
+					DriverName="HFA"
+			else:
+				TheFilePath="" # required by GDAL
+				
+			# Create the file
+			
+			TheDriver = gdal.GetDriverByName(DriverName)
+	
+			OutputGDALDataset = TheDriver.Create(TheFilePath, self.WidthInPixels, self.HeightInPixels, self.NumBands,self.GDALDataType)
+			
+			# This has to be done before the GDAL Dataset is written out
+			OutputGDALDataset.SetGeoTransform((self.XMin, self.PixelWidth, 0, self.YMax, 0, self.PixelHeight))
+	 
+			if (OutputGDALDataset is None): raise Exception("Sorry, there was a problem creating the file at "+TheFilePath)
+	
+			# write out the data
 			Count=0
 			while (Count<self.NumBands):
-				TheBand=self.GDALDataset.GetRasterBand(Count+1)
-				self.TheBands.append(TheBand.ReadAsArray())
+				OutputBand = OutputGDALDataset.GetRasterBand(Count+1)
+	
+				TheBand=self.TheBands[Count]
+				
+				if (self.NoDataValue is not None): # Restore the no data values
+					
+					OutputBand.SetNoDataValue(self.NoDataValue)
+										
+					# Use the NoDateValue where masked, the valid data otherwise
+					TheBand=numpy.where(self.TheMask,self.NoDataValue,TheBand)
+					
+				OutputBand.WriteArray(TheBand)
+				OutputBand.FlushCache()
+	
 				Count+=1
-
-			self.NoDataValue=outband.GetNoDataValue()
-
-			if (self.NoDataValue!=None): # have to create the mask
-				self.TheMask=numpy.equal(self.TheBands[0],self.NoDataValue)
-
+			
+			#self.GDALDataset=OutputGDALDataset
+			
+		return(OutputGDALDataset)
+		
 	def Save(self,TheFilePath):
 		""" 
 		Creates a new raster in the layer.
@@ -761,33 +848,23 @@ class SpaDatasetRaster:
 		Returns:
 			none
 		"""
-
-		FileName,Extension=os.path.splitext(TheFilePath)
-
-		Extension=Extension.lower()
-
-		DriverName="GTiff"
-		if (Extension==".png"):
-			DriverName="PNG"
-		elif (Extension==".jpg"):
-			DriverName="JPG"
-		elif (Extension==".asc"):
-			DriverName="AAIGrid"
-		elif (Extension==".img"):
-			DriverName="HFA"
-
-		# Create the file
-		driver = gdal.GetDriverByName(DriverName)
-
-		outRaster = driver.Create(TheFilePath, self.WidthInPixels, self.HeightInPixels, self.NumBands,self.GDALDataType)
-
-		if (outRaster==None): raise Exception("Sorry, there was a problem creating the file at "+TheFilePath)
+		self.FilePath=TheFilePath
 		
-		outRaster.SetGeoTransform((self.XMin, self.PixelWidth, 0, self.YMax, 0, self.PixelHeight))
-
+		# make sure the data is loaded
+		self.GetBands() 
+		
+		# Reset the GDAL dataset to create another one
+		#self.GDALDataset=None
+		
+		# Getting the new GDAL dataset with a filepath will save it to a file
+		OutputGDALDataset=self.GetGDALDataset2(TheFilePath)
+		
 		###########################################
+		
+		#OutputGDALDataset.SetGeoTransform((self.XMin, self.PixelWidth, 0, self.YMax, 0, self.PixelHeight))
+		
 		#Setup the spatial reference
-		if (self.UTMZone!=None):
+		if (self.UTMZone is not None):
 			# setup the spatial reference
 			srs = osr.SpatialReference()
 
@@ -797,89 +874,11 @@ class SpaDatasetRaster:
 
 			srs.SetWellKnownGeogCS(self.GCS)
 
-			outRaster.SetProjection(srs.ExportToWkt())
+			OutputGDALDataset.SetProjection(srs.ExportToWkt())
 			
-		elif (self.SpatialReference!=None):
-			#outRasterSRS = self.SpatialReference.Clone()
-			
-			#outRasterSRS.SetProjection(self.TheWKT)
+		elif (self.SpatialReference is not None):
+			OutputGDALDataset.SetProjection(self.SpatialReference.ExportToWkt())
 
-			outRaster.SetProjection(self.SpatialReference.ExportToWkt())
-
-		# write out the data
-		Count=0
-		while (Count<self.NumBands):
-			outband = outRaster.GetRasterBand(Count+1)
-
-			TheBand=self.TheBands[Count]
-
-			# Restore the no data values
-			if (self.NoDataValue!=None):
-				outband.SetNoDataValue(self.NoDataValue)
-				TheBand=numpy.where(self.TheMask,self.NoDataValue,TheBand)
-
-			outband.WriteArray(TheBand)
-			outband.FlushCache()
-
-			Count+=1
-	#######################################################################
-	# Transforms
-	def Polygonize(self):
-		from SpaPy import SpaVectors
-		import shapely.wkt
-		""" 
-		Converts a raster to a polygon feature set.  Each contiguous area of the raster
-		(i.e. ajoining pixels that have the same value) are grouped as one polygon.  The
-		only attribute is "band1" as this only works for one band.
-
-		Parameters:
-			none
-		Returns:
-			A Polygon featurset
-		"""
-		drv = ogr.GetDriverByName("Memory")
-
-		# get spatial reference info (jjg - I think we can just clone the SpatialReference)
-		srs = osr.SpatialReference()
-		srs.ImportFromWkt(self.SpatialReference.ExportToWkt())
-
-		# Create a temporary data set in memory
-		DestinDataSource = drv.CreateDataSource('out')	
-		DestinLayer = DestinDataSource.CreateLayer('', srs = srs ) #
-
-		# add the attribute for the pixel values
-		AttributeType=ogr.OFTInteger
-		if ((self.GDALDataType==gdal.GDT_Float32) or (self.GDALDataType==gdal.GDT_Float64)): AttributeType=ogr.OFSTFloat32;
-
-		FieldDefinition = ogr.FieldDefn("band1", AttributeType)
-		DestinLayer.CreateField(FieldDefinition)
-		AttributeIndex = 0
-
-		# create polygons from the first raster band
-		srcband=self.GDALDataset.GetRasterBand(1)
-
-		gdal.Polygonize(srcband, None, DestinLayer, AttributeIndex, [], callback=None)	
-
-		# create a new dataset in SpaVectors
-		OutDataset = SpaVectors.SpaDatasetVector()
-
-		OutDataset.AttributeDefs["band1"]='int:1'
-
-		for feature in DestinLayer:
-			# get the spatial reference and convert to WKT and then convert to a ShapelyGeometry
-			#ShapelyGeometry=feature.GetGeometryRef().Clone()
-
-			Geometry=feature.GetGeometryRef().ExportToWkt() # This is slow but currently required.  In the future we might support both types and then convert as needed jjg
-			ShapelyGeometry=shapely.wkt.loads(Geometry)
-
-			# setup the attribute array and add the feature to the output dataset
-			Value=feature.GetField(0)
-			if (isinstance(Value,list)): Value=Value[0]
-			Attributes={"band1":Value}
-
-			OutDataset.AddFeature(ShapelyGeometry,Attributes)
-
-		return(OutDataset)
 
 	#def Warp(self,DestinFilePath):
 		#"""
@@ -903,8 +902,8 @@ class SpaDatasetRaster:
 		"""
 
 		BandIndex=0
-		NewDataset=self.Clone()
-		NewBands=[]
+		NewDataset=None #self.Clone()
+		NewBands=None #[]
 
 		if (isinstance(Input2, numbers.Number)==False): # input is another dataset
 			# jjg - add checks for same number of bands, convertion to save width, height, and data type
@@ -913,7 +912,14 @@ class SpaDatasetRaster:
 			
 			if (self.GetNumBands()!=Input2.GetNumBands()): raise Exception("Sorry, the number of bands in the two rasters must match")
 			
-			for TheBand in self.TheBands: # add each of the bands from each of the datasets
+			# resample the inputs if needed
+			Input1,Input2=ResampleToMatch(self,Input2)
+			
+			# this could change the dimensions of the raster bands and mask so we need to clone them here
+			NewDataset=Input1.Clone()
+			NewBands=[]
+			
+			for TheBand in Input1.TheBands: # add each of the bands from each of the datasets
 				Band2=Input2.GetBand(BandIndex)
 
 				if (Operation==SPAMATH_ADD): NewBands.append(numpy.add(TheBand,Band2))
@@ -941,6 +947,10 @@ class SpaDatasetRaster:
 				BandIndex+=1
 
 		else: # input is a scalar value ... all unary operators are in here
+			
+			NewDataset=self.Clone()
+			NewBands=[]
+			
 			for TheBand in self.TheBands:
 				if (Operation==SPAMATH_ADD): NewBands.append(numpy.add(TheBand,Input2))
 				elif (Operation==SPAMATH_SUBTRACT): NewBands.append(numpy.subtract(TheBand,Input2))
@@ -1172,49 +1182,98 @@ class SpaDatasetRaster:
 		Reclassify a raster dataset using numpy
 
 		Parameters:
-			InputClasses: A SpaDatasetRaster object OR a string representing the path to the raster file
-			OutputClasses: A string representing the path to the file where output will be stored
+			InputClasses: if the mode is "discrete" then the InputClasses is a simple array that includes
+			values that will be set to their matching values in OutputClasses[].
+			If the mode is "range", then the InputClasses contains an array of arrays where each secondary
+			array contains a minimum and maximum value for each range that will be reclassed to its
+			corresponding OutputClass.
+			OutputClasses: An array of values for the reclassed pixels.
 			mode: The format of the values which will be used for reclassification (either range or discrete)
 
 		Returns:
 			A SpaRasterDataset object reclassified to the parameters outlined in mode
 		"""
 
-		if mode=="discrete":
-			NewDataset = SpaDatasetRaster()
-			NewDataset = self.Clone()
-			NewBands=[]
-			condlist=[]
-			choicelist=[]
-			for TheBand in self.TheBands:
-				for cond in InputClasses:
-					condlist.append(TheBand==cond)
-				for choice in OutputClasses:
-					choicelist.append(numpy.ones_like(TheBand)*choice)
-				NewBand=numpy.select(condlist,choicelist)
-				NewBands.append(NewBand)
-			NewDataset.SetBands(NewBands)
-			return(NewDataset)
+		NewDataset=None
+		
+		#if mode=="discrete":
+			#NewDataset = SpaDatasetRaster()
+			#NewDataset = self.Clone()
+			#NewBands=[]
+			#condlist=[]
+			#choicelist=[]
+			
+			#for TheBand in self.TheBands:
+				#for cond in InputClasses:
+					#condlist.append(TheBand==cond)
+				#for choice in OutputClasses:
+					#choicelist.append(numpy.ones_like(TheBand)*choice)
+				#NewBand=numpy.select(condlist,choicelist)
+				#NewBands.append(NewBand)
+				
+			#NewDataset.SetBands(NewBands)
 
-		elif mode=="range":
-			NewDataset = SpaDatasetRaster()
-			NewDataset = self.Clone()
-			NewBands=[]
-			condlist=[]
-			choicelist=[]
-			for TheBand in self.TheBands:
-				for cond in InputClasses:
-					if InputClasses.index(cond)==0:
-						condlist.append(numpy.logical_and(TheBand>cond[0],TheBand<=cond[1]))
-
+		#elif mode=="range":
+		NewDataset = SpaDatasetRaster()
+		NewDataset = self.Clone()
+		NewBands=[]
+		TheMask=self.TheMask
+		
+		# If the user specified None for an output value, we need to add those pixels to the raster's mask
+		TheBand=self.TheBands[0]
+			
+		Index=0
+		while (Index<len(InputClasses)):
+			
+			OutputValue=OutputClasses[Index]
+			
+			if (OutputValue is None):
+				Range=InputClasses[Index]
+				
+				if mode=="discrete":
+					# Get an array with 1s where pixels are within the range and 0s otherwise
+					BooleanArray=(TheBand==Range)
+				else:
+					# Get an array with 1s where pixels are within the range and 0s otherwise
+					BooleanArray=numpy.logical_and(TheBand>Range[0],TheBand<=Range[1])
+			
+				# Or in any new pixels that should be added as NoData
+				if (TheMask is not None):
+					TheMask=numpy.logical_or(BooleanArray,TheMask)
+				else:
+					TheMask=BooleanArray
+					
+			Index+=1
+			
+		# Reclassify the bands
+		for TheBand in self.TheBands:
+			
+			# For each input class, replace the pixels within the range with the matching output value
+			Index=0
+			while (Index<len(InputClasses)):
+				Range=InputClasses[Index]
+			
+				OutputValue=OutputClasses[Index]
+				
+				# If the output value is None, mask the desired pixels, otherwise, convert the desired pixels to the output value
+				if (OutputValue is not None):
+					
+					if mode=="discrete":
+						# Get an array with 1s where pixels are within the range and 0s otherwise
+						BooleanArray=(TheBand==Range)
 					else:
-						condlist.append(numpy.logical_and(TheBand>cond[0],TheBand<=cond[1]))
-				for choice in OutputClasses:
-					choicelist.append(numpy.ones_like(TheBand)*choice)
-				NewBand=numpy.select(condlist,choicelist)
-				NewBands.append(NewBand)
-			NewDataset.SetBands(NewBands)
-			return(NewDataset)
+						BooleanArray=numpy.logical_and(TheBand>Range[0],TheBand<=Range[1])
+					
+					TheBand=numpy.where(BooleanArray,OutputValue,TheBand) # removes the mask!
+					
+				Index+=1
+			
+			NewBands.append(TheBand)
+			
+		NewDataset.SetBands(NewBands)
+		NewDataset.SetMask(TheMask)
+		
+		return(NewDataset)
 
 #######################################################################
 # additional core transforms
@@ -1253,6 +1312,7 @@ class SpaResample(SpaBase.SpaTransform):
 		GDALDataset = gdal.Translate('', GDALDataset, format="MEM", projWin = NewBounds)
 		NewDataset.Load(GDALDataset)
 		GDALDataset = None
+		
 		return(NewDataset)
 
 	def NumpyCrop(self,InputRasterDataset,Bounds):
@@ -1318,6 +1378,7 @@ class SpaResample(SpaBase.SpaTransform):
 			InputBand[super_threshold_indices] = 0
 			OutputBand=scipy.ndimage.zoom(InputBand, ZoomFactor)
 
+							 
 			OutputBands.append(OutputBand)
 
 			OutputDataset.HeightInPixels=numpy.size(OutputBand,0)
@@ -1328,6 +1389,7 @@ class SpaResample(SpaBase.SpaTransform):
 		# add the new band to the output dataset
 		OutputDataset.TheBands=OutputBands
 
+		# the zoom function strips off the mask and returns a regular numpy array so we have to get the mask, zoom it, and put it back
 		TheMask = InputRasterDataset.TheMask
 		if (TheMask is not None):
 			OutputMask = scipy.ndimage.zoom(TheMask,ZoomFactor,order=1,mode='nearest') # Must be order=1 for boolean values
@@ -1472,10 +1534,10 @@ class SpaResample(SpaBase.SpaTransform):
 					if ((InputColumnIndex>=0) and (InputColumnIndex<InputWidthInPixels)):
 
 						# only copy the data if there is no mask or the mask pixel is non-zero
-						if ((InputMask==None) or (InputMask[InputRowIndex][InputColumnIndex]!=0)):
+						if ((InputMask is None) or (InputMask[InputRowIndex][InputColumnIndex]!=0)):
 
 							# if there is a mask, set it to opaque
-							if (OutputMask!=None):
+							if (OutputMask is not None):
 
 								TheOutputMask[OutputRowIndex][OutputColumnIndex]=100
 
@@ -2144,17 +2206,17 @@ def ResampleToMatch(TheDataset1,TheDataset2):
 		TheDataset1=Resample(TheDataset1,Resolution1/Resolution2)
 	
 	# Make sure the masks only cover areas that are masked in both rasters
-	if (TheDataset1.TheMask is not None):
-		if (TheDataset2.TheMask is not None): # both have masks, combine them
+	#if (TheDataset1.TheMask is not None):
+		#if (TheDataset2.TheMask is not None): # both have masks, combine them
 			
-			TheDataset1.TheMask=numpy.logical_or(TheDataset1.TheMask,TheDataset2.TheMask)
-			TheDataset2.TheMask=numpy.copy(TheDataset1.TheMask)
+			#TheDataset1.TheMask=numpy.logical_or(TheDataset1.TheMask,TheDataset2.TheMask)
+			#TheDataset2.TheMask=numpy.copy(TheDataset1.TheMask)
 		
-		else: # Only TheDataset1 has a mask
-			TheDataset2.TheMask=numpy.copy(TheDataset1.TheMask)
+		#else: # Only TheDataset1 has a mask
+			#TheDataset2.TheMask=numpy.copy(TheDataset1.TheMask)
 	
-	elif (TheDataset2.TheMask is not None):
-		TheDataset1.TheMask=numpy.copy(TheDataset2.TheMask)
+	#elif (TheDataset2.TheMask is not None):
+		#TheDataset1.TheMask=numpy.copy(TheDataset2.TheMask)
 		
 	#print("Width in pixels: "+format(TheDataset1.GetWidthInPixels())) 
 	#print("Height in pixels: "+format(TheDataset1.GetHeightInPixels())) 
@@ -2163,3 +2225,23 @@ def ResampleToMatch(TheDataset1,TheDataset2):
 	#print("Height in pixels: "+format(TheDataset2.GetHeightInPixels())) 
 
 	return(TheDataset1,TheDataset2)
+
+def Merge(InputFilePath1,InputFilePath2,OutputFilePath):
+	"""
+	Merges two rasters.
+	Parameters:
+		InputRasterDataset: A SpaDatasetRaster object OR a string representing the path to the raster file
+		Bounds: new extent formatted as [x1,y1,x2,y2] 
+	Return:
+		A cropped SpaRasterDataset object 
+
+	"""
+	
+	args=[]
+	args.append("") # First entry is call to python
+	args.append("-o")
+	args.append(OutputFilePath)
+	args.append(InputFilePath1)
+	args.append(InputFilePath2)
+	
+	gdal_merge.main(args)

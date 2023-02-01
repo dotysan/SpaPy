@@ -84,7 +84,7 @@ class SpaProjector(SpaBase.SpaBase):
 
 class SpaProj(SpaProjector):
 	""" 
-	Class to manage the data associated with a spatial layer
+	Class to project data from one CRS (FromCRS) to another CRS (ToCRS).
 	"""
 	def __init__(self):
 		super().__init__()
@@ -112,10 +112,13 @@ class SpaProj(SpaProjector):
 	############################################################################
 	# SpaBase Functions
 	############################################################################
-	#def SetSettings(self,Class,Settings):
-		#super().SetSettings(Class,Settings)
-
-		#self.Reset()
+	def SetSettings(self,Class,Settings):
+		super().SetSettings(Class,Settings)
+		if (Class==SpaProj):
+			self.FromCRS=pyproj.CRS.from_user_input(4326 ) # WGS84 Geographic
+			self.ToCRS=pyproj.crs.CRS(Settings["Parameters"])
+		
+		self.Reset()
 
 	def SetCRSes(self,FromCRS,ToCRS):
 		if (isinstance(FromCRS,osr.SpatialReference)):
@@ -143,22 +146,45 @@ class SpaProj(SpaProjector):
 			none
 		"""
 		self.TheTransform=None
-
+		self.InserseTransform=None
+		
 	############################################################################
 	# SpaProj Protected Functions
 	############################################################################
 	def Initialize(self):
 		if (self.TheTransform==None):
-			self.TheTransform=Transformer.from_crs(self.FromCRS, self.ToCRS, always_xy=True)
+			if (self.FromCRS!=None) and (self.ToCRS!=None):
+				self.TheTransform=Transformer.from_crs(self.FromCRS, self.ToCRS, always_xy=True)
 	##############################################################################
 	def TransformCoordinate(self,X,Y):
+		"""
+		Perform a transform on a coordinate.
+		"""
 
+		TheCoordinate=None
+		
 		self.Initialize()
 
-		TheCoordinate=self.TheTransform.transform(X,Y)
+		if (self.TheTransform!=None):
+			TheCoordinate=self.TheTransform.transform(X,Y)
 
 		return(TheCoordinate)
 
+	##############################################################################
+	def InverseTransformCoordinate(self,X,Y):
+		"""
+		Perform an inverse transform on a coordinate (i.e. transform from the ToCRS to the FromCRS).
+		"""
+		if (self.InserseTransform==None):
+			if (self.FromCRS!=None) and (self.ToCRS!=None):
+				self.InserseTransform=Transformer.from_crs(self.ToCRS,self.FromCRS,  always_xy=True)
+
+		if (self.InserseTransform!=None):
+			TheCoordinate=self.InserseTransform.transform(X,Y)
+
+		return(TheCoordinate)
+
+	##############################################################################
 	def Transform(self,TheObject):
 		""" 
 		Handles projecting a wide variety of types of data
@@ -226,7 +252,7 @@ class SpaProj(SpaProjector):
 		elif (isinstance(TheObject,shapely.geometry.LineString)): # have a polygon, 
 			TheCoordinates=self.Transform(TheObject.coords) # deal with interior polys later
 			if (len(TheCoordinates)>=2): # polygon must have at least 3 coordinates
-				Result=LineString(TheCoordinates)
+				Result=shapely.geometry.LineString(TheCoordinates)
 
 		elif (isinstance(TheObject,shapely.geometry.Point)): # have a polygon, 
 			TheCoordinates=self.Transform(TheObject.coords) # deal with interior polys later
@@ -285,23 +311,7 @@ class SpaProj(SpaProjector):
 		#Settings=self.GetSettings(SpaProj)
 		self.Initialize()
 
-		#self.TheProjection=GetProjection(,LatNewPole,Settings["Parameters"])
-		#ProjectionCode=Settings["ProjectionCode"]
-		#Parameters=Settings["Parameters"]
-
-		#ToCRS=pyproj.CRS.from_user_input(self.ToCRS)
-
 		DesitnationSRS=self.ToCRS.to_proj4()
-
-		# Version to convert dictionary to proj4 string
-		#Parameters=self.ToCRS
-
-		#DesitnationSRS="" #"+proj="+ProjectionCode
-
-		#for key in Parameters:
-		#	DesitnationSRS+=" +"+key+"="+format(Parameters[key])
-
-		#DesitnationSRS=self.ToCRS
 
 		# Create the new dataset
 		NewDataset=SpaRasters.SpaDatasetRaster()
@@ -310,9 +320,10 @@ class SpaProj(SpaProjector):
 		NewDataset.Save(OutputFilePath) # this is ugly but it is the only way we could figure out to create a GDALDataset
 		#NewDataset.Load(OutputFilePath)
 
-		InputGDALDataset = TheObject.GDALDataset
-		#OutputGDALDataset = NewDataset.GDALDataset
-		GDALDataset = gdal.Warp(OutputFilePath,InputGDALDataset,dstSRS=DesitnationSRS)
+		InputGDALDataset = TheObject.GetGDALDataset()
+		
+		# warp the dataset (jjg - put the new dataset into a new SpaRaster object)
+		TempGDALDataset = gdal.Warp(OutputFilePath,InputGDALDataset,dstSRS=DesitnationSRS)
 
 		NewDataset.Load(OutputFilePath)
 
@@ -347,7 +358,8 @@ def Transform(Input1,CRS1,CRS2=None):
 	# setup the Original and New CRSes
 	if (CRS2==None): # first CRS is the new CRS
 		CRS2=CRS1
-		CRS1=Input1.GetCRS()		
+		CRS1=Input1.GetCRS()
+		
 	TheProjector.SetCRSes(CRS1,CRS2)
 
 	# Transform the object
@@ -357,7 +369,7 @@ def Transform(Input1,CRS1,CRS2=None):
 
 def TransformRaster(Input1,OutputFilePath,CRS1,CRS2=None):
 	"""
-	Project just about anything to a new spatial reference.
+	Project a raster to a new CRS.
 	Currently, it is assume the inputs are in geographic coordinates and the datum does not change.
 
 	Parameters:
@@ -381,47 +393,3 @@ def TransformRaster(Input1,OutputFilePath,CRS1,CRS2=None):
 	NewLayer=TheProjector.TransformRaster(Input1,OutputFilePath)
 
 	return(NewLayer)
-#def Project(Input1,Parameters,LatNewPole=90):
-	#"""
-	#Project just about anything to a new spatial reference.
-	#Currently, it is assume the inputs are in geographic coordinates and the datum does not change.
-
-	#Parameters:
-		#Input1: vector dataset object to be projected
-		#Parameters: input dataset parameters
-		#LatNewPole: Optional-input latitude of new pole if desired
-	#Returns:
-		#Projected raster or vector dataset object
-	#"""
-	#Input1=SpaBase.GetInput(Input1)
-
-	#TheProjector=SpaProj()
-	#TheProjector.SetSettings(SpaProj,{
-		#"LatNewPole":LatNewPole, # optional
-		#"Parameters":Parameters,
-	#})
-	##
-	#NewLayer=TheProjector.ProjectFromGeographic(Input1)
-	#return(NewLayer)
-
-#def ProjectRaster(Input1,Parameters,OutputFilePath=None):
-	#"""
-	#Project just about anything to a new spatial reference.
-	#Currently, it is assume the inputs are in geographic coordinates and the datum does not change.
-
-	#Parameters:
-		#Input1: raster or vector dataset object to be projected
-		#Parameters: input dataset parameters
-	#Returns:
-		#Projected raster dataset object
-	#"""
-	#Input1=SpaBase.GetInput(Input1)
-
-	#TheProjector=SpaProj()
-	#TheProjector.SetSettings(SpaProj,{
-		#"Parameters":Parameters,
-	#})
-	##
-	#NewLayer=TheProjector.ProjectRaster(Input1,OutputFilePath)
-	#return(NewLayer)
-

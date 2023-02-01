@@ -294,7 +294,7 @@ class SpaView():
 				if (Closed):
 					X=Coordinates[0]
 					Y=Coordinates[1]
-					self.RenderRefLine(LastX,LastY,X,Y)
+					self.RenderLine(LastX,LastY,X,Y)
 				
 		except:
 			TheError=sys.exc_info()
@@ -522,16 +522,29 @@ class SpaView():
 	#		Min=numpy.amin(TheBand)
 			
 		#	Max=numpy.amax(TheBand)
-			super_threshold_indices = TheBand<0.00000001
-			TheBand[super_threshold_indices] = 0
-			Min=numpy.amin(TheBand)
+			#super_threshold_indices = TheBand<0.00000001
+			#TheBand[super_threshold_indices] = 0
+			#Min=numpy.amin(TheBand)
 			
-			Factor=255/Max
-			TheBand=TheBand*Factor
+			if (Max!=0):
+				Range=(Max-Min)
+				Factor=255/Range
+				TheBand=(TheBand-Min)*Factor
 		
-		TheRasterImage = PIL.Image.fromarray(numpy.uint8(TheBand))
-		
-		###########################################
+			###########################################
+		# 
+		TheMask=TheRasterDataset.GetMask()
+		if (isinstance(TheMask,numpy.ndarray)):
+			TheBand=numpy.uint8(TheBand)
+			#OutputBand=numpy.ma.masked_array(TheBand,TheMask)
+			TheMask=numpy.logical_not(TheMask)
+			TheMaskImage = PIL.Image.fromarray(TheMask)
+			TheRasterImage = PIL.Image.fromarray(TheBand)
+			TheRasterImage.putalpha(TheMaskImage)
+		else:
+			TheRasterImage = PIL.Image.fromarray(numpy.uint8(TheBand))
+			
+		#TheRasterImage = PIL.Image.fromarray(numpy.uint8(TheBand))		###########################################
 		# Draw the raster into the view
 		TheImage=self.GetImage()
 

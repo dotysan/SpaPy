@@ -11,11 +11,14 @@
 #   This is because we do not know for many transforms if the final result will be all polygons, all multipolgons or a mix of these.
 #   The current solution is to promote polygon files to MultiPolygon and LineString files to MultiLineString
 #
-# This class uses the open source libraries Fiona for reading and writing
-# shapefiles and Shapely for a number of transformations.
+# This class uses PyShp which appears to work much better than ogr or fiona.
+#
+# osgeo.osr is used to convert ESRI pro
 #
 # Resources:
-# Fiona docs: https://fiona.readthedocs.io/en/stable/manual.html#introduction
+# https://pypi.org/project/pyshp/#reading-records
+# https://pcjericks.github.io/py-gdalogr-cookbook/projection.html#create-an-esri-prj-file
+#
 # Shapely docs: https://shapely.readthedocs.io/en/stable/manual.html#objects
 # - https://gis.stackexchange.com/questions/97545/using-fiona-to-write-a-new-shapefile-from-scratch
 # - https://github.com/Toblerity/Fiona
@@ -38,11 +41,19 @@
 ############################################################################
 import random
 import colorsys
+import os
+import math
 
 # Open source spatial libraries
-import fiona
+from osgeo import osr
+
 import shapely
-import math
+from shapely import wkt
+from shapely import speedups
+speedups.disable()
+
+import shapefile
+import pyproj
 
 # SpaPy libraries
 from SpaPy import SpaBase
@@ -66,6 +77,74 @@ SPAVECTOR_CONTAINS=10
 ######################################################################################################
 # Private utility functions
 ######################################################################################################
+def GetShapefileTypeFromType(Type):
+	pyshptype=None
+	
+	if Type == "Null":
+		pyshptype = 0
+	elif Type == "Point":
+		pyshptype = 1
+	elif Type == "LineString":
+		pyshptype = 3
+	elif Type == "Polygon":
+		pyshptype = 5
+	elif Type == "MultiPoint":
+		pyshptype = 8
+	elif Type == "MultiLineString":
+		pyshptype = 3
+	elif Type == "MultiPolygon":
+		pyshptype = 5
+	
+	return(pyshptype)
+
+# DEFINE/COPY-PASTE THE SHAPELY-PYSHP CONVERSION FUNCTION
+def shapely_to_pyshp(shapelygeom):
+	"""
+	From: https://gis.stackexchange.com/questions/52705/how-to-write-shapely-geometries-to-shapefiles/52708
+	"""
+	# first convert shapely to geojson
+	
+	shapelytogeojson = shapely.geometry.mapping
+	
+	geoj = shapelytogeojson(shapelygeom)
+	# create empty pyshp shape
+	record = shapefile.Shape()
+	
+	# set shapetype
+	pyshptype=GetShapefileTypeFromType(geoj["type"])
+	record.shapeType = pyshptype
+	
+	# set points and parts
+	if geoj["type"] == "Point":
+		record.points = [geoj["coordinates"]] # had to add the array as shapefile.py expects the points to be in an array
+		record.parts = [0]
+	elif geoj["type"] in ("MultiPoint","Linestring"):
+		record.points = [geoj["coordinates"]]
+		record.parts = [0]
+	elif geoj["type"] in ("Polygon"):
+		index = 0
+		points = []
+		parts = []
+		for eachmulti in geoj["coordinates"]:
+			points.extend(eachmulti)
+			parts.append(index)
+			index += len(eachmulti)
+		record.points = points
+		record.parts = parts
+	elif geoj["type"] in ("MultiPolygon","MultiLineString"):
+		index = 0
+		points = []
+		parts = []
+		for polygon in geoj["coordinates"]:
+			for part in polygon:
+				points.extend(part)
+				parts.append(index)
+				index += len(part)
+		record.points = points
+		record.parts = parts
+		
+	return record
+
 def GetSegmentLength(self,X1,Y1,X2,Y2):
 	"""
 	Retrieves segment length for polyline with two coordinates (begining and end)
@@ -121,24 +200,25 @@ class SpaDatasetVector:
 		self.TheGeometries=[]
 		self.TheAttributes=[]
 
-		self.Driver="ESRI Shapefile"
+		#self.Driver="ESRI Shapefile"
 		self.Type=None
-		self.AttributeDefs={}
-
+		self.AttributeDefinitions=[]
+		self.SpatialReference=None
+		
 		# Coordinate reference systems / spatial references can be in either a WKT format or a fiona CRS string.
 		# The fiona CRS strings can either contain an EPSG code or a set of PROJ parameters.
 		# EPSG Code
 		# wkt: Well Know Text Format 
 		# Proj parameters: this is a dictionary of key/value pairs where the key is the parameter and the value is, well, the value
 		# Which ever of these are set, will be written to the file on a save.  Only one should be set at any given time.
-		self.CRS="epsg:4326"
-		self.crs_wkt=None
+		#self.CRS="epsg:4326"
+		#self.crs_wkt=None
 		#self.ProjParameters=None
 
 	############################################################################
 	# Prviate functions
 	############################################################################
-	def GetDefaultValue(self,Attribute):
+	def GetDefaultValue(self,AttributeIndex):
 		"""
 		Retrieves the default value for the selected attribute
 
@@ -147,14 +227,17 @@ class SpaDatasetVector:
 		Returns:
 			Default value
 		"""
-		TypeString=self.AttributeDefs[Attribute]
-		Tokens=TypeString.split(":")
-		Type=Tokens[0]
+		Temp=type(AttributeIndex)
+		if (type(AttributeIndex)==str): 
+			AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
+		TypeString=self.AttributeDefinitions[AttributeIndex]
+		Type=TypeString["Type"]
 
 		Default=None
-		if (Type=="int"): Default=0
-		elif (Type=="float"): Default=0.0
-		elif (Type=="str"): Default=""
+		if (Type=="Integer"): Default=0
+		elif (Type=="Float"): Default=0.0
+		elif (Type=="String"): Default=""
 		return(Default)
 
 	def _AddGeometries(self,TheGeometry,TheAttributes,NewGeometries,NewAttributes):
@@ -189,8 +272,6 @@ class SpaDatasetVector:
 	############################################################################
 	# Functions to interact with files (shapefiles and CSVs)
 	############################################################################
-	from shapely import speedups
-	speedups.disable()
 
 	def Load(self,FilePath):
 		"""
@@ -201,25 +282,100 @@ class SpaDatasetVector:
 		Results:
 			none
 		"""	
-		TheShapefile=fiona.open(FilePath, 'r')
+		#gdal.UseExceptions() # does not appear to work.  OGR just crashes without errors regularly
+		
+		# Open the file
+		TheReader = shapefile.Reader(FilePath,encoding='latin-1')
+		
+		self.Type=TheReader.shapeType # Shapefile types
+		
+		self.BoundingBox=TheReader.bbox
+		
+		# OGR driver crashes so let's load everything
+		self.AttributeDefinitions=[]
+		
+		AttributeDefs=TheReader.fields
+		NumAttributes=len(AttributeDefs)
+		NumAttributes-=1 # skip the DeletionFlag
+		
+		Index=0
+		while (Index<NumAttributes):
+			FieldDef=AttributeDefs[Index+1]
+		
+			Name=FieldDef[0]
+			TypeName=FieldDef[1]
+			
+			if (TypeName=="C"):
+				TypeName="String"
+			elif (TypeName=="N"):
+				TypeName="Integer"
+			elif (TypeName=="F"):
+				TypeName="Float"
+			elif (TypeName=="L"):
+				TypeName="Boolean"
+			elif (TypeName=="D"):
+				TypeName="Date"
+					
+			AttributeDefinition={
+				"Name": Name,
+				"Type":  TypeName,
+				"Width": FieldDef[2],
+				"Precision": FieldDef[3]
+			}
+			self.AttributeDefinitions.append(AttributeDefinition)
+			
+			Index+=1
 
-		self.CRS=TheShapefile.crs
-		self.crs_wkt=TheShapefile.crs_wkt
-		self.Driver=TheShapefile.driver
-		self.Type=TheShapefile.schema["geometry"]
-		self.AttributeDefs=TheShapefile.schema["properties"]
-
-		GeometryIndex=0
-		for TheFeature in TheShapefile:
-			ShapelyGeometry=None
-			if (TheFeature['geometry']!=None):
-				ShapelyGeometry = shapely.geometry.shape(TheFeature['geometry']) # Converts coordinates to a shapely feature
+		# Get the geomeries and attributes
+		TheShapes=TheReader.shapes()
+		NumFeatures=len(TheShapes)
+		
+		FeatureIndex=0
+		while (FeatureIndex<NumFeatures):
+			TheGeometry=TheShapes[FeatureIndex]
+			
+			TheGeometry = TheGeometry.__geo_interface__
+			
+			ShapelyGeometry = shapely.geometry.shape(TheGeometry) # Converts coordinates to a shapely feature
 
 			self.TheGeometries.append(ShapelyGeometry)
-			self.TheAttributes.append(TheFeature['properties'])
-			GeometryIndex+=1
+			
+			# Load all the attributes
+			TheProperties=[]
+			InputAttributes=TheReader.records()
+			AttributeIndex=0
+			while (AttributeIndex<NumAttributes):
+				AttributeDefinition=self.AttributeDefinitions[AttributeIndex]
+				InputAttributeRow=InputAttributes[FeatureIndex]
+				Name=AttributeDefinition["Name"]
+				TheValue=InputAttributeRow[Name]
+				TheProperties.append(TheValue)
+				AttributeIndex+=1
+				
+			self.TheAttributes.append(TheProperties)
+			FeatureIndex+=1
 
-		TheShapefile.close()
+		TheReader.close()
+		
+		#
+		
+		Index=FilePath.rindex(".")
+		FilePath=FilePath[:Index]
+		FilePath+=".prj"
+		
+		if (os.path.exists(FilePath)):
+			TheFile=open(FilePath,"r")
+			TheWKT=TheFile.read()
+			TheFile.close()
+			
+			spatialRef = osr.SpatialReference()
+			
+			if (spatialRef!=None):
+				spatialRef.ImportFromWkt(TheWKT)
+				
+				spatialRef.MorphFromESRI()
+				self.SpatialReference=spatialRef
+		
 
 	def CopyMetadata(self,OtherLayer):
 		"""
@@ -231,11 +387,16 @@ class SpaDatasetVector:
 		Returns:
 			none
 		"""	
-		self.CRS=OtherLayer.CRS
-		self.crs_wkt=OtherLayer.crs_wkt
-		self.Driver=OtherLayer.Driver
+		#self.crs_wkt=OtherLayer.crs_wkt
+		#self.Driver=OtherLayer.Driver
 		self.Type=OtherLayer.Type
-		self.AttributeDefs=OtherLayer.AttributeDefs
+		self.SpatialReference=OtherLayer.SpatialReference
+		
+		self.AttributeDefinitions=[]
+		Index=0
+		while (Index<len(OtherLayer.AttributeDefinitions)):
+			self.AttributeDefinitions.append(OtherLayer.AttributeDefinitions[Index].copy())
+			Index+=1
 
 	def Save(self,FilePath):
 		"""
@@ -246,39 +407,94 @@ class SpaDatasetVector:
 		Returns:
 		        none
 		"""	
-		TheSchema={"geometry":self.Type,"properties":self.AttributeDefs}
-
-		TheCRS=self.CRS
-		if (isinstance(TheCRS,int)): TheCRS={'init': 'epsg:'+format(TheCRS), 'no_defs': True} # integer must be an EPSG Code
-		elif (self.crs_wkt!=None): TheCRS=self.crs_wkt
-		elif (isinstance(TheCRS,str)):
-			Temp=TheCRS.lower()
-			Index=Temp.find("epsg")
-			if (Index!=-1): # need to pull the EPSG code, otherwise, the string may already be a proj4 string
-				Temp=Temp[Index+5:]
-				TheCRS={'init': 'epsg:'+format(Temp), 'no_defs': True}
-		else: # Should be a spatial reference object
-			TheCRS=TheCRS.to_proj4()
-
-		TheOutput=fiona.open(FilePath,'w',  encoding='utf-8',crs=TheCRS, driver=self.Driver,schema=TheSchema) # jjg - added encoding to remove warning on Natural Earth shapefiles
-
+		# Remove output shapefile if it already exists
+		#if os.path.exists(FilePath):
+		#	outDriver.DeleteDataSource(FilePath)
+		
+		# Create the output shapefile
+		TheWriter = shapefile.Writer(FilePath)
+		TheWriter.field('field1', 'C')
+		
+		ShapefileType=GetShapefileTypeFromType(self.Type)
+		TheWriter.shapeType=ShapefileType
+		
+		
+		# Add the definitions for the attributes
+		NumAttributes=len(self.AttributeDefinitions)
+		
+		AttributeIndex=0
+		while (AttributeIndex<NumAttributes):
+			AttributeDefinition=self.AttributeDefinitions[AttributeIndex]
+			
+			# Create the definition
+			TheName= AttributeDefinition["Name"]
+			TheType= AttributeDefinition["Type"]
+			TheWidth= AttributeDefinition["Width"]
+			ThePrecision= AttributeDefinition["Precision"]
+			
+			if (TheType=="String"):
+				TheWriter.field(TheName, 'C', size=TheWidth)
+			elif (TheType=="Integer"):
+				TheWriter.field(TheName, 'N',decimal=ThePrecision)
+			elif (TheType=="Float"):
+				TheWriter.field(TheName, 'F',decimal=ThePrecision)
+			elif (TheType=="Date"):
+				TheWriter.field(TheName, 'D')
+			elif (TheType=="Boolean"):
+				TheWriter.field(TheName, 'L')				
+			AttributeIndex+=1
+			
+		# Write out the features
 		NumFeatures=self.GetNumFeatures()
 		FeatureIndex=0
 		while (FeatureIndex<NumFeatures):
 			TheGeometry=self.TheGeometries[FeatureIndex]
 
-			if (TheGeometry!=None):
-				FionaGeometry=shapely.geometry.mapping(TheGeometry) # converts shapely geometry back to a dictionary
-				TheAttributes=self.TheAttributes[FeatureIndex]
-
-				if (FionaGeometry["type"]=="GeometryCollection"): 
-					Test=None # do nothing
-				else:
-					TheOutput.write({'geometry': FionaGeometry, 'properties':TheAttributes})
+			converted_shape = shapely_to_pyshp(TheGeometry)
+			
+			TheWriter.shape(converted_shape)
+			
+			# Add tje attributes
+			Records=[None] # have to add something for field1
+			AttributeIndex=0
+			while (AttributeIndex<NumAttributes):
+				AttributeDefinition=self.AttributeDefinitions[AttributeIndex]
+		
+				TheRow=self.TheAttributes[FeatureIndex]
+				
+				TheValue=TheRow[AttributeIndex]
+				
+				# Create the definition
+				TheType= AttributeDefinition["Type"]
+		
+				Records.append(TheValue) 
+				AttributeIndex+=1
+				
+			TheWriter.record(*tuple(Records)) #The second trick
 
 			FeatureIndex+=1
 
-		TheOutput.close()
+		TheWriter.close()
+		
+		# Add the spatial reference
+		if (self.SpatialReference!=None):
+			
+			TheText = self.SpatialReference.ExportToWkt()
+			Temp=osr.SpatialReference()
+			Temp.SetFromUserInput(TheText)
+			#print(spatialRef)
+			
+			Temp.MorphToESRI()
+			
+			Index=FilePath.rindex(".")
+			FilePath=FilePath[:Index]
+			FilePath+=".prj"
+			
+			TheText=Temp.ExportToWkt()
+			
+			file = open(FilePath, 'w')
+			file.write(TheText)
+			file.close()		
 	############################################################################
 	# General Information functions
 	############################################################################
@@ -320,9 +536,9 @@ class SpaDatasetVector:
 		Returns:
 			The CRS is returned as a string but may contain an EPSG number or a proj4 command string (see https://proj4.org/)
 		"""	
-		return(self.CRS)
+		return(self.SpatialReference)
 
-	def SetCRS(self,CRS):
+	def SetCRS(self,TheCRS):
 		"""
 		Sets the CRS for this dataset. 
 
@@ -331,8 +547,24 @@ class SpaDatasetVector:
 		Returns: 
 			none
 		"""	
-		self.CRS=CRS
-		self.crs_wkt=None
+		if ( isinstance(TheCRS, int)): # EPSG
+			Temp = osr.SpatialReference()
+			Temp.ImportFromEPSG( TheCRS )
+			#Temp.SetWellKnownGeogCS( "EPSG:"+format(CRS ))
+			#print(Temp)
+			TheCRS=Temp
+	
+		if ( isinstance(TheCRS, pyproj.CRS)): # EPSG
+			Temp = osr.SpatialReference()
+			TheWKT=TheCRS.to_wkt()
+			Temp.ImportFromWkt( TheWKT )
+			#Temp.SetWellKnownGeogCS( "EPSG:"+format(CRS ))
+			#print(Temp)
+			TheCRS=Temp
+			
+		#print(CRS)
+		self.SpatialReference=TheCRS
+		#self.crs_wkt=None
 
 	############################################################################
 	# Attribute management
@@ -346,7 +578,9 @@ class SpaDatasetVector:
 		Returns:
 			The number of columns of attributes.
 		"""	
-		return(len(self.AttributeDefs))
+		NumAttributes=len(self.AttributeDefinitions)
+		
+		return(NumAttributes)
 
 	def GetAttributeName(self,Index):
 		"""
@@ -357,8 +591,11 @@ class SpaDatasetVector:
 		Returns:
 			The name of an attribute column
 		"""	
-		Thing=list(self.AttributeDefs.keys())
-		return(Thing[Index])
+		Name=self.AttributeDefinitions[Index]["Name"]
+		
+		Name=Name.encode('unicode-escape').decode('ascii')
+		
+		return(Name)
 
 	def GetAttributeType(self,Index):
 		"""
@@ -369,11 +606,13 @@ class SpaDatasetVector:
 		Returns:
 			Type of column, options include "int","float","str"
 		"""	
-		Thing=list(self.AttributeDefs.keys())
-		Key=Thing[Index]
-		Value=self.AttributeDefs[Key]
-		Tokens=Value.split(":")
-		return(Tokens[0])
+		FieldDef=self.AttributeDefinitions[Index]
+		
+			
+		#Key=Thing[Index]
+		#Value=self.AttributeDefs[Key]
+		#Tokens=Value.split(":")
+		return(FieldDef["Type"])
 
 	def GetAttributeWidth(self,Index):
 		"""
@@ -384,11 +623,9 @@ class SpaDatasetVector:
 		Returns:
 			The width of the attribute.  See AddAttribute() for more information.
 		"""	
-		Thing=list(self.AttributeDefs.keys())
-		Key=Thing[Index]
-		Value=self.AttributeDefs[Key]
-		Tokens=Value.split(":")
-		return(Tokens[1])
+		FieldDef=self.AttributeDefinitions[Index]
+	
+		return(FieldDef["Width"])
 
 	def AddAttribute(self,Name,Type,Width=None,Default=None):
 		"""
@@ -420,11 +657,19 @@ class SpaDatasetVector:
 			elif (Type=="float"): Width=16.6
 			elif (Type=="str"): Width=254
 
-		self.AttributeDefs[Name]=Type+":"+format(Width)
+		AttributeDefinition={
+			"Name":Name,
+			"Type":Type,
+			"Width":Width,
+			"Precision":10
+			}
+		self.AttributeDefinitions.append(AttributeDefinition)
+		
+		#self.AttributeDefs[Name]=Type+":"+format(Width)
 		for Row in self.TheAttributes:
-			Row[Name]=Default
+			Row.append(Default)
 
-	def GetAttributeColumn(self,Name):
+	def GetAttributeColumn(self,AttributeIndex):
 		"""
 		Returns an entire column of attribute values.
 
@@ -434,12 +679,14 @@ class SpaDatasetVector:
 		Returns:
 			List with the values from the attribute column
 		"""
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
 		Result=[]
 		for Row in self.TheAttributes:
-			Result.append(Row[Name])
+			Result.append(Row[AttributeIndex])
 		return(Result)
 
-	def SelectEqual(self,Name,Match):
+	def SelectEqual(self,AttributeIndex,Match):
 		"""
 		Returns a selection array with the rows that have the specified
 		attribute value matching the "Match" value
@@ -450,13 +697,15 @@ class SpaDatasetVector:
 		Returns:
 			List of boolean values with True where the condition is true and False otherwise.
 		"""
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
 		Result=[]
 		for Row in self.TheAttributes:
-			if (Row[Name]==Match): Result.append(True)
+			if (Row[AttributeIndex]!=None) and (Row[AttributeIndex]==Match): Result.append(True)
 			else: Result.append(False)
 		return(Result)
 
-	def SelectGreater(self,Name,Match):
+	def SelectGreater(self,AttributeIndex,Match):
 		"""
 		Returns a selection array with the rows that have the specified
 		attribute value greater than the "Match" value
@@ -468,13 +717,15 @@ class SpaDatasetVector:
 		Returns:
 			List of boolean values with True where the condition is true and False otherwise.
 		"""
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
 		Result=[]
 		for Row in self.TheAttributes:
-			if (Row[Name]>Match): Result.append(True)
+			if (Row[AttributeIndex]!=None) and (Row[AttributeIndex]>Match): Result.append(True)
 			else: Result.append(False)
 		return(Result)
 
-	def SelectGreaterThanOrEqual(self,Name,Match):
+	def SelectGreaterThanOrEqual(self,AttributeIndex,Match):
 		"""
 		Returns a selection array with the rows that have the specified
 		attribute value greater than or equal to the "Match" value
@@ -486,13 +737,15 @@ class SpaDatasetVector:
 		Returns:
 			List of boolean values with True where the condition is true and False otherwise.
 		"""
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
 		Result=[]
 		for Row in self.TheAttributes:
-			if (Row[Name]>=Match): Result.append(True)
+			if (Row[AttributeIndex]!=None) and (Row[AttributeIndex]>=Match): Result.append(True)
 			else: Result.append(False)
 		return(Result)
 
-	def SelectLess(self,Name,Match):
+	def SelectLess(self,AttributeIndex,Match):
 		"""
 		Returns a selection array with the rows that have the specified
 		attribute value less than the "Match" value
@@ -504,13 +757,15 @@ class SpaDatasetVector:
 		Returns:
 			List of boolean values with True where the condition is true and False otherwise.
 		"""
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
 		Result=[]
 		for Row in self.TheAttributes:
-			if (Row[Name]<Match): Result.append(True)
+			if (Row[AttributeIndex]!=None) and (Row[AttributeIndex]<Match): Result.append(True)
 			else: Result.append(False)
 		return(Result)
 
-	def SelectLessThanOrEqual(self,Name,Match):
+	def SelectLessThanOrEqual(self,AttributeIndex,Match):
 		"""
 		Returns a selection array with the rows that have the specified
 		attribute value that is less than or equal to the specied match value.
@@ -522,9 +777,11 @@ class SpaDatasetVector:
 		Returns:
 			List of boolean values with True where the condition is true and False otherwise.
 		"""
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
 		Result=[]
 		for Row in self.TheAttributes:
-			if (Row[Name]<=Match): Result.append(True)
+			if (Row[AttributeIndex]!=None) and (Row[AttributeIndex]<=Match): Result.append(True)
 			else: Result.append(False)
 		return(Result)
 
@@ -548,7 +805,31 @@ class SpaDatasetVector:
 		self.TheGeometries=NewGeometries
 		self.TheAttributes=NewAttributes
 
-	def DeleteAttribute(self,Name):
+	def GetAttributeIndexFromName(self,Name):
+		"""
+		Finds the index to the specified attribute name
+
+		Parameters:
+			Name: Name of the attribute column to delete.
+		Returns:
+			none
+		"""
+		AttributeIndex=-1
+		
+		if (type(Name)==str):
+			Index=0
+			while (Index<len(self.AttributeDefinitions)) and (AttributeIndex==-1):
+				AttributeDefinition=self.AttributeDefinitions[Index]
+				Name1=AttributeDefinition["Name"]
+				if (Name==Name1): 
+					AttributeIndex=Index
+				Index+=1
+		else:
+			AttributeIndex=Name
+			
+		return(AttributeIndex)
+			
+	def DeleteAttribute(self,AttributeIndex):
 		"""
 		Deletes the specified column of attributes
 
@@ -557,11 +838,13 @@ class SpaDatasetVector:
 		Returns:
 			none
 		"""
-		del(self.AttributeDefs[Name])
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		
+		del(self.AttributeDefinitions[AttributeIndex])
 		for Row in self.TheAttributes:
-			del (Row[Name])
+			del (Row[AttributeIndex])
 
-	def GetAttributeValue(self,AttributeName,Row):
+	def GetAttributeValue(self,AttributeIndex,Row):
 		"""
 		Returns the attribute value in the specified column and for the specified row/feature.
 
@@ -571,9 +854,10 @@ class SpaDatasetVector:
 		Returns:
 			Attribute value at the specified column and row.
 		"""
-		return(self.TheAttributes[Row][AttributeName])
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		return(self.TheAttributes[Row][AttributeIndex])
 
-	def SetAttributeValue(self,AttributeName,Row,NewValue):
+	def SetAttributeValue(self,AttributeIndex,Row,NewValue):
 		"""
 		Sets the attribute value in the specified column and for the specified row/feature.
 
@@ -584,7 +868,8 @@ class SpaDatasetVector:
 		Returns:
 			none
 		"""
-		self.TheAttributes[Row][AttributeName]=NewValue
+		AttributeIndex=self.GetAttributeIndexFromName(AttributeIndex)
+		self.TheAttributes[Row][AttributeIndex]=NewValue
 
 	############################################################################
 
@@ -646,30 +931,33 @@ class SpaDatasetVector:
 
 		Parameters:
 			TheGeometry: The shapely geometry to add to the dataset formatted as list of coordinates es: [(x1,y1), (x2,y2), (x3,y3), (x4,y4),(x5,y5)]
-			TheAttributes: The new attributes to add.  If unspecified, default attribuets will be added.
+			TheAttributes: An array of new attribute values.  If unspecified, default attributes will be added.
 		Returns:
 			none
 
 		"""
 
-		if (self.Type==None): 
-			self.SetType(TheGeometry.geom_type)
+		# Add the geometry if specified
+		if (TheGeometry!=None):
+			if (self.Type==None): 
+				self.SetType(TheGeometry.geom_type)
+	
+			# By default, we only support 
+			if (TheGeometry.geom_type!=self.Type): 
+				if (TheGeometry.geom_type=="Polygon"): TheGeometry=shapely.geometry.MultiPolygon([TheGeometry])
+				elif (TheGeometry.geom_type=="LineString"): TheGeometry=shapely.geometry.MultiLineString([TheGeometry])
+				#else:
+					#raise Exception("The geometry does not match the specified type of "+format(self.Type))
+	
+			self.TheGeometries.append(TheGeometry)
 
-		# By default, we only support 
-		if (TheGeometry.geom_type!=self.Type): 
-			if (TheGeometry.geom_type=="Polygon"): TheGeometry=shapely.geometry.MultiPolygon([TheGeometry])
-			elif (TheGeometry.geom_type=="LineString"): TheGeometry=shapely.geometry.MultiLineString([TheGeometry])
-			else:
-				raise Exception("The geometry does not match the specified type of "+format(self.Type))
-
-		self.TheGeometries.append(TheGeometry)
-
+		# Add the attributes if specified
 		if (TheAttributes==None):
-			TheAttributes={}
+			TheAttributes=[]
 
-			for Attribute in self.AttributeDefs:
-				Default=self.GetDefaultValue(Attribute)
-				TheAttributes[Attribute]=Default
+			for Attribute in self.AttributeDefinitions:
+				Default=self.GetDefaultValue(Attribute["Name"])
+				TheAttributes.append(Default)
 
 		self.TheAttributes.append(TheAttributes)
 

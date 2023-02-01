@@ -64,7 +64,7 @@ class SpaTopoTools(SpaBase.SpaTransform):
 		NewDataset=SpaRasters.SpaDatasetRaster()
 		NewDataset.CopyPropertiesButNotData(Input1)
 
-		array=Input1.TheBands[0]
+		array=Input1.GetBand(0)#[0]
 		azimuth = 360.0 - azimuth
 
 		x, y = numpy.gradient(array)
@@ -76,7 +76,7 @@ class SpaTopoTools(SpaBase.SpaTransform):
 		shaded = numpy.sin(altituderad)*numpy.sin(slope) + numpy.cos(altituderad)*numpy.cos(slope)*numpy.cos((azimuthrad - numpy.pi/2.) - aspect)
 		shaded = 255*(shaded + 1)/2
 
-		NewDataset.TheBands=[shaded]
+		NewDataset.SetBands([shaded])
 		return(NewDataset)
 
 	#def Slope(self,Input1,OutputFilePath=None):
@@ -171,7 +171,7 @@ class SpaTopoTools(SpaBase.SpaTransform):
 		else:
 			TempFilePath=OutputFilePath
 		
-		GDALDataset1 = Input1.GDALDataset
+		GDALDataset1 = Input1.GetGDALDataset()
 		gdal.DEMProcessing(TempFilePath, GDALDataset1, Operation)
 		
 		if (OutputFilePath==None): 
@@ -195,8 +195,8 @@ class SpaTopoTools(SpaBase.SpaTransform):
 		"""
 		Input1=SpaBase.GetInput(Input1)
 		
-		NewDataset=SpaRasters.SpaDatasetRaster()
-		NewDataset.CopyPropertiesButNotData(Input1)
+		#NewDataset=SpaRasters.SpaDatasetRaster()
+		#NewDataset.CopyPropertiesButNotData(Input1)
 
 		UseNoData=0
 		NoDataValue=0
@@ -204,7 +204,8 @@ class SpaTopoTools(SpaBase.SpaTransform):
 			UseNoData=1
 			NoDataValue=Input1.GetNoDataValue()
 			
-		TheBand = Input1.GDALDataset.GetRasterBand(1)
+		TheGDALDataset=Input1.GetGDALDataset()
+		TheBand = TheGDALDataset.GetRasterBand(1)
 		
 		#Generate layer to save Contourlines in
 		#TheDataset=SpaVectors.SpaDatasetVector() #create a new layer
@@ -230,7 +231,7 @@ class SpaTopoTools(SpaBase.SpaTransform):
 		gdal.ContourGenerate(TheBand, ContourInterval, contourBase, [], UseNoData,NoDataValue, contour_shp, 0, 1)
 		ogr_ds = None
 		
-		return(NewDataset)
+		#return(NewDataset)
 
 ###############################################################################
 # One line functions
