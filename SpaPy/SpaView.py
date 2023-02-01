@@ -445,15 +445,16 @@ class SpaView():
 			elif (TheType=="Polygon"):
 				self.RenderRefPolygon(TheGeometry)
 			elif (TheType=="MultiPolygon"):
-				for ThePolygon in TheGeometry:
+				print(len(TheGeometry.geoms))
+				for ThePolygon in TheGeometry.geoms:
 					self.RenderRefPolygon(ThePolygon)
 			elif (TheType=="LineString"):
 				self.RenderRefLineString(TheGeometry)
 			elif (TheType=="MultiLineString"):
-				for ThePolygon in TheGeometry:
+				for ThePolygon in TheGeometry.geoms:
 					self.RenderRefLineString(ThePolygon)				
 			elif (TheType=="GeometryCollection"): # collections are typically empty for shapefiles
-				for TheSubGeometry in TheGeometry:
+				for TheSubGeometry in TheGeometry.geoms:
 					self.RenderRefGeometry(TheSubGeometry)
 			else:
 				print("Unsupported Type: "+TheType)

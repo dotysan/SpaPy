@@ -261,11 +261,11 @@ class SpaDatasetVector:
 				NewGeometries.append(TheGeometry)
 				NewAttributes.append(TheAttributes)
 			elif ((TheType=="MultiPolygon") or (TheType=="MultiPoint") or (TheType=="MultiLineString")):
-				for ThePolygon in TheGeometry:
+				for ThePolygon in TheGeometry.geoms:
 					NewGeometries.append(ThePolygon)
 					NewAttributes.append(TheAttributes)
 			elif (TheType=="GeometryCollection"): # collections are typically empty for shapefiles
-				for TheSubGeometry in TheGeometry:
+				for TheSubGeometry in TheGeometry.geoms:
 					self._AddGeometries(TheSubGeometry,TheAttributes,NewGeometries,NewAttributes)
 			else:
 				print("Unsupported Type: "+TheType)

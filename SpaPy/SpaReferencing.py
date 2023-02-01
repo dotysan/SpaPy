@@ -227,7 +227,7 @@ class SpaProj(SpaProjector):
 
 		elif (isinstance(TheObject,shapely.geometry.MultiPolygon)): # have a polygon, 
 			ThePolygons=[]
-			for ThePolygon in TheObject:
+			for ThePolygon in TheObject.geoms:
 				NewPolygon=self.Transform(ThePolygon) # deal with interior polys later
 				if (NewPolygon!=None):
 					ThePolygons.append(NewPolygon)
@@ -236,7 +236,7 @@ class SpaProj(SpaProjector):
 
 		elif (isinstance(TheObject,shapely.geometry.MultiLineString)): # have an array of line strings , 
 			TheLineStrings=[]
-			for TheLineString in TheObject:
+			for TheLineString in TheObject.geoms:
 				NewLineString=self.Transform(TheLineString) # deal with interior polys later
 				if (NewLineString!=None):
 					TheLineStrings.append(NewLineString)

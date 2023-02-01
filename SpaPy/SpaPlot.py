@@ -85,11 +85,11 @@ class SpaPlot:
 				#pyplot.scatter(CoordXs,CoordYs, color='#6699cc', marker='^')
 				
 			elif (TheType=="MultiPolygon"):
-				for ThePolygon in TheGeometry:
+				for ThePolygon in TheGeometry.geoms:
 					self.PlotPolygon(ThePolygon)
 					
 			elif (TheType=="GeometryCollection"): # collections are typically empty for shapefiles
-				for TheSubGeometry in TheGeometry:
+				for TheSubGeometry in TheGeometry.geoms:
 					self.PlotGeometry(TheSubGeometry)
 					
 			else:

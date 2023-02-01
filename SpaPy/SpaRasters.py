@@ -54,7 +54,7 @@ import scipy
 from osgeo import ogr
 import scipy.ndimage
 from osgeo import osr
-from osgeo.utils import gdal_merge
+from osgeo_utils import gdal_merge
 
 # Spa Libraries
 from SpaPy import SpaBase
